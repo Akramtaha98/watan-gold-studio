@@ -11,7 +11,7 @@
   "unchanged_core_definitions": 76,
   "schemas_preserved": true,
   "files": {
-    "watan_gold_studio.py": "7134e88720c1426b1381f7b88350451e4a8b75b59497870592f6a2626c0c57b2",
+    "watan_gold_studio.py": "eebae6225521394b5dbf655cbc82c64c4c69767b7e7729f903e4aa0e61c9676e",
     "storage.py": "8ba7b6706cd2790eb4928ef15e65ce6fcd40f7d42b8a5168c6460c3dc2e60c69",
     "ptsl_api.py": "afae8de43adc16229e0775aaefe868cf68243d39645ae82f8171df3bca790e96",
     "analytics.py": "971b559384bb2c1daa297d79a4475611344907c805c578c9632e5e6bc83f9c33",
@@ -35,5 +35,21 @@
     "remote_matches_local": true,
     "private_verified": true
   },
-  "postgresql_schema": "Dedicated non-exposed warisan schema. Live PostgreSQL test not run locally; TEST_POSTGRES_URL or the inactive CI template enables it."
+  "postgresql_schema": "Dedicated non-exposed warisan schema. Live PostgreSQL test not run locally; TEST_POSTGRES_URL or the inactive CI template enables it.",
+  "batch_recovery_fix": {
+    "regression_tests_passed": 211,
+    "skipped": 1,
+    "new_regression_cases": 6,
+    "result": "PASS",
+    "cases": [
+      "stale selector preserves a healthy current batch",
+      "missing active batch preserves records and requires explicit recovery save",
+      "empty stale reference returns to upload",
+      "stale reviewer auto-load does not loop",
+      "portal status race recovers safely",
+      "missing during save preserves an unsaved review decision"
+    ],
+    "live_ui": "Existing saved batch reopened through selector successfully; no corpus or credentials included in source publication.",
+    "data_safety": "Private consistent SQLite backup created; no database deletion or reset performed."
+  }
 }

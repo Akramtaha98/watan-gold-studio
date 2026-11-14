@@ -34,6 +34,8 @@ The API listens at **127.0.0.1:8001**. Both processes use the same `DATABASE_URL
 
 Use **Saved batch** to reopen work after a browser/server restart. **Start new batch** creates a fresh workspace without deleting old data. **Release History** inspects and re-downloads earlier, checksum-verified snapshots; missing filesystem mirrors can be restored from the authoritative DB archive.
 
+If a saved-batch reference is missing from the current database, the app now recovers without a traceback. A different healthy active batch stays open. If the missing batch was active, its masked in-memory workspace is retained and exports pause until you explicitly choose **Save recovered workspace as a new batch**. Save that recovery before closing the browser or switching workspaces; it does not recreate an unavailable original DB row or delete another batch.
+
 **PTSL Reviewer Only Mode** hides upload/technical settings, raw pipeline metrics and exports, retaining focused queue/reviewed/role counters, comparison, decisions and Excel. Linguist defaults to this view unless a workspace mode was explicitly chosen. `?mode=ptsl` opens the focused view; saved batches and queue progress are now shared through persistence. At completion it shows a handoff card; Full Pipeline Mode performs the release. Roles in the local workspace are trusted curator declarations, not per-person authentication; use the production access gate/reverse proxy described below.
 
 ## Output contracts

@@ -1529,10 +1529,33 @@ def ui_new_persistent_batch(st):
     st.session_state.upload_generation = st.session_state.get("upload_generation",0)+1
     st.session_state.batch_selection_pending = ""
     st.session_state.history_view = False
+    st.session_state.recovery_required = False
+
+
+def ui_missing_persistent_batch(st, batch_id):
+    """Detach a missing DB reference without erasing the masked workspace in RAM."""
+    active = st.session_state.get("batch_id")
+    if active is None or active == batch_id:
+        st.session_state.batch_id, st.session_state.db_revision = None, None
+        st.session_state.release_job, st.session_state.release_key = None, None
+        st.session_state.workflow_batch_key, st.session_state.upload_signature = None, None
+        st.session_state.editing_id, st.session_state.ptsl_pack_key = None, None
+        st.session_state.persisted_context_digest = None
+        st.session_state.pop("restore_context", None)
+        st.session_state.recovery_required = bool(st.session_state.get("batch", {}).get("records"))
+        st.session_state.batch_selection_pending = ""
+    else:
+        # A stale dropdown event must not replace a different, healthy active batch.
+        st.session_state.batch_selection_pending = active
+    st.session_state.missing_batch_notice = "That saved batch is not available in the current database. Your current workspace has been kept."
 
 
 def ui_load_persistent_batch(st, store, batch_id):
-    saved = store.load_batch(batch_id)
+    try:
+        saved = store.load_batch(batch_id)
+    except KeyError:
+        ui_missing_persistent_batch(st, batch_id)
+        return False
     if st.session_state.get("batch_id") == batch_id and any(r["status"] == "PTSL_REVIEW" for r in st.session_state.get("batch",{}).get("records",[])) and not any(r["status"] == "PTSL_REVIEW" for r in saved["snapshot"]["records"]):
         st.session_state.pending_review_completion = True
     st.session_state.batch = saved["snapshot"]
@@ -1544,6 +1567,8 @@ def ui_load_persistent_batch(st, store, batch_id):
     st.session_state.workflow_batch_key = None
     st.session_state.ptsl_pack_key = None
     st.session_state.batch_selection_pending = batch_id
+    st.session_state.recovery_required = False
+    return True
 
 
 def ui_save_persistent_batch(st, store, config, policy, settings, new=False, context_only=False):
@@ -1564,6 +1589,9 @@ def ui_save_persistent_batch(st, store, config, policy, settings, new=False, con
         ui_load_persistent_batch(st, store, st.session_state.batch_id)
         st.session_state.sync_notice = "A newer external review was loaded. Please check it before retrying your action."
         st.rerun()
+    except KeyError:
+        ui_missing_persistent_batch(st, st.session_state.batch_id)
+        st.rerun()
 
 
 def ui_portal_sync(st, store):
@@ -1576,12 +1604,15 @@ def ui_portal_sync(st, store):
             if not batch_id:
                 if st.button("Sync / Refresh Status", key="portal_refresh_empty") or auto:
                     saved = store.list_batches()
-                    if saved:
-                        ui_load_persistent_batch(st, store, saved[0]["id"])
+                    if saved and ui_load_persistent_batch(st, store, saved[0]["id"]):
                         st.rerun()
                 st.caption("Waiting for a persistent batch.")
                 return
-            current = store.load_batch(batch_id)
+            try:
+                current = store.load_batch(batch_id)
+            except KeyError:
+                ui_missing_persistent_batch(st, batch_id)
+                st.rerun()
             refresh = st.button("Sync / Refresh Status", key="portal_refresh")
             if refresh or current["revision"] != st.session_state.db_revision:
                 previous_queue = sum(r["status"] == "PTSL_REVIEW" for r in st.session_state.batch["records"])
@@ -1589,7 +1620,11 @@ def ui_portal_sync(st, store):
                 if previous_queue and not any(r["status"] == "PTSL_REVIEW" for r in current["snapshot"]["records"]):
                     st.session_state.review_completion_notice = True
                 st.rerun()
-            progress = store.status(batch_id)
+            try:
+                progress = store.status(batch_id)
+            except KeyError:
+                ui_missing_persistent_batch(st, batch_id)
+                st.rerun()
             st.caption(f"Batch {batch_id[:8]} · {progress['remaining']} remaining · {progress['completed']} reviewed · {progress['total_queued']} queued")
             st.progress(progress['completed']/progress['total_queued'] if progress['total_queued'] else 0)
         portal_progress()
@@ -1771,11 +1806,25 @@ def main():
             st.session_state.connection = {"signature": connection_signature, "ok": False}
             st.session_state.connection_error = "Connection failed. Check the URL, model ID and advanced settings."
         st.rerun()
+    if st.session_state.get("missing_batch_notice"):
+        st.warning(st.session_state.pop("missing_batch_notice"))
     if history_view:
         ui_release_history(st, store)
         return
+    if st.session_state.get("recovery_required"):
+        st.title("Recover your workspace")
+        st.info("The current database no longer has this batch. Your masked records and review history are still in this browser session. Save them as a new batch before switching workspaces, or use Start new batch to start over.")
+        if st.button("Save recovered workspace as a new batch", type="primary", disabled=not config_valid):
+            ui_save_persistent_batch(st, store, config, policy, settings, new=True)
+            st.session_state.recovery_required = False
+            st.rerun()
+        return
     if st.session_state.get("batch_id"):
-        saved = store.load_batch(st.session_state.batch_id)
+        try:
+            saved = store.load_batch(st.session_state.batch_id)
+        except KeyError:
+            ui_missing_persistent_batch(st, st.session_state.batch_id)
+            st.rerun()
         if saved["revision"] != st.session_state.db_revision:
             old_remaining = sum(r["status"] == "PTSL_REVIEW" for r in st.session_state.batch["records"])
             ui_load_persistent_batch(st, store, st.session_state.batch_id)

@@ -16,3 +16,5 @@ Scope: persistent batches/reviews/releases, JSONL-first wizard, analytics and au
   EVIDENCE: GitHub reports PRIVATE/isPrivate=true for Akramtaha98/watan-gold-studio; remote main matched audited source commit c8ce3ceaeab6f3c68b5ccd65e586306d27eedc9a. Staging audit excluded DB, releases, raw data and generated credentials. Active workflow rejected for missing OAuth workflow scope; complete CI config is shipped as inactive template without changing permissions.
 
 Measured acceptance: 6 met, 0 unmet, 0 abandoned. Local tests: 205 passed; hosted PostgreSQL test explicitly skipped until TEST_POSTGRES_URL/CI is configured. External portal hosting and production deployment credentials were not supplied.
+
+Batch-reference bugfix: full suite 211 passed, 1 PostgreSQL-only check skipped. Six new recovery/race regressions pass. Live saved-batch selector round trip succeeded; private SQLite backup created, no data deleted.

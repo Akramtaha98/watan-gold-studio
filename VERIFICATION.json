@@ -1,0 +1,36 @@
+{
+  "scope": "Persistent platform: storage, portal API, analytics, JSONL-first snapshots/history, guided wizard",
+  "python": "3.13.2",
+  "local_tests": {
+    "passed": 205,
+    "skipped": 1,
+    "skip_reason": "TEST_POSTGRES_URL not configured locally; CI provisions PostgreSQL",
+    "exit_status": 0,
+    "output_sha256": "36c6af8bbb19073cd66aaf304f95d75fda268609edc4773b7d3f5ad9dfc4e700"
+  },
+  "unchanged_core_definitions": 76,
+  "schemas_preserved": true,
+  "files": {
+    "watan_gold_studio.py": "7134e88720c1426b1381f7b88350451e4a8b75b59497870592f6a2626c0c57b2",
+    "storage.py": "8ba7b6706cd2790eb4928ef15e65ce6fcd40f7d42b8a5168c6460c3dc2e60c69",
+    "ptsl_api.py": "afae8de43adc16229e0775aaefe868cf68243d39645ae82f8171df3bca790e96",
+    "analytics.py": "971b559384bb2c1daa297d79a4475611344907c805c578c9632e5e6bc83f9c33",
+    "manage.py": "66eadf3e54ee75089897401872eb45618b4ff0cc6061188fbb955807688f6d6b",
+    "mock_qwen.py": "9d902ae3be1f21144f828fc81391ebaa8f4193335b0d1c640a55553308d287ee"
+  },
+  "visual_qa": "Wide and narrow analytics/release history verified; authenticated API-style submission cleared persistent queue and browser auto-advanced to Step 3; browser finalized persistent release. Isolated fictional sample only.",
+  "deployment_limits": [
+    "External portal URL and hosted database credentials were not provided; no live hosted deployment claim.",
+    "Shared-workspace secret and role-scoped service token are not named-user/tenant RBAC.",
+    "No live H200 verification quality claim."
+  ],
+  "github": {
+    "planned_repository": "Akramtaha98/watan-gold-studio",
+    "required_visibility": "PRIVATE",
+    "runtime_data_and_secrets_excluded": true,
+    "repository": "https://github.com/Akramtaha98/watan-gold-studio",
+    "visibility": "PRIVATE",
+    "ci": "Inactive template under ci/: current OAuth credential lacks workflow scope. No credential permissions changed."
+  },
+  "postgresql_schema": "Dedicated non-exposed warisan schema. Live PostgreSQL test not run locally; TEST_POSTGRES_URL or the inactive CI template enables it."
+}

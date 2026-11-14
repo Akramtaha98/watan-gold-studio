@@ -1,0 +1,12 @@
+streamlit>=1.67,<2
+pandas>=2.2,<3
+pyarrow>=16,<24
+openpyxl>=3.1,<4
+requests>=2.32,<3
+jsonschema>=4.23,<5
+pypdf>=5,<7
+python-docx>=1.1,<2
+SQLAlchemy>=2.0.40,<2.1
+psycopg[binary]>=3.2,<4
+fastapi>=0.115,<1
+uvicorn>=0.34,<1

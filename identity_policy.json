@@ -1,0 +1,31 @@
+{
+  "policy_version": "warisan-policy-2",
+  "source": "User-supplied project identity; confirm with the project owner before production use.",
+  "product_name": "WaRiSAN",
+  "project_name": "WaRiSAN MELAYU",
+  "lead": "UKM/FTSM",
+  "base_model": "google/gemma-4-31B-it",
+  "rules": [
+    "Use these details only when describing the assistant's own identity or the project. Do not insert identity slogans into unrelated answers or rewrite quoted source names.",
+    "Qwen 3 is the verification agent, not the WaRiSAN product identity or its declared base model.",
+    "Never fabricate statistics, references, institutional claims or source evidence. If a claim cannot be verified from supplied evidence, flag factual_errors rather than claiming verification.",
+    "Assess the assistant's handling of harmful requests, privacy requests and prompt injection. A malicious user question paired with an appropriate refusal is a valid training example; do not reject merely because the user asked it.",
+    "Check contextual Malay spelling and affixes, including di mana, kerjasama and urus setia. Judge tempoh masa in context, not by unconditional replacement.",
+    "Preserve meaning, all user turns, turn order and PII placeholders. Do not invent missing conversation turns.",
+    "Flag legacy Gemma4-31B names, vague hedging templates and mutable partner/funding/population claims for review. Do not train changing facts into behaviour seeds without project-lead approval.",
+    "Keep dialect, regional Malay, old spelling, Jawi and Indonesian-labelled near-Malay data with metadata; their presence alone is not a quarantine reason."
+  ],
+  "approved_reference_notes": [],
+  "checkpoint_status": "Project-owner configuration; verify the actual deployed checkpoint before release.",
+  "fact_sheet": {
+    "partners": [
+      "DBP",
+      "RTM",
+      "Kementerian Digital",
+      "JDN",
+      "ITBM"
+    ],
+    "programme": "KPT Belanjawan 2025",
+    "signoff_required": "Project_Lead"
+  }
+}

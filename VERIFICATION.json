@@ -30,7 +30,10 @@
     "runtime_data_and_secrets_excluded": true,
     "repository": "https://github.com/Akramtaha98/watan-gold-studio",
     "visibility": "PRIVATE",
-    "ci": "Inactive template under ci/: current OAuth credential lacks workflow scope. No credential permissions changed."
+    "ci": "Inactive template under ci/: current OAuth credential lacks workflow scope. No credential permissions changed.",
+    "source_commit_verified": "c8ce3ceaeab6f3c68b5ccd65e586306d27eedc9a",
+    "remote_matches_local": true,
+    "private_verified": true
   },
   "postgresql_schema": "Dedicated non-exposed warisan schema. Live PostgreSQL test not run locally; TEST_POSTGRES_URL or the inactive CI template enables it."
 }

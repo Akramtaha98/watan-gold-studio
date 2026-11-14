@@ -103,3 +103,7 @@ python -m pytest -q tests
 ```
 
 All tests isolate storage and mock inference. Coverage includes readers, schemas, roles, Excel atomicity, masking, token bounds, benchmark isolation, persistent restarts/conflicts, authenticated API submissions, webhook signing/retries, release history, native analytics and wizard progression after external review. A real PostgreSQL integration test runs when `TEST_POSTGRES_URL` is set; The template `ci/github-actions-tests.yml` provisions an isolated PostgreSQL service when installed as an Actions workflow. The current GitHub OAuth credential lacks workflow scope, so it is shipped inactive; application source and tests can still be pushed privately. Activate it later by adding the template at `.github/workflows/tests.yml` with an appropriately authorized GitHub login. A live H200 is not required for CI.
+
+## Large-data and adversarial tests
+
+See [test instructions](docs/HARD_TESTING.md) and [measured results](docs/HARD_TEST_RESULTS.md). Generate upload fixtures with `python scripts/stress_lab.py generate`, run the isolated pipeline test with `python scripts/stress_lab.py pipeline`, and assess the configured endpoint with `python scripts/stress_lab.py qwen`. The endpoint assessment explicitly distinguishes the demonstration mock from real Qwen inference.

@@ -11,7 +11,7 @@
   "unchanged_core_definitions": 76,
   "schemas_preserved": true,
   "files": {
-    "watan_gold_studio.py": "eebae6225521394b5dbf655cbc82c64c4c69767b7e7729f903e4aa0e61c9676e",
+    "watan_gold_studio.py": "3d263ad1d4a1af2a1f0da098aede1df011b3ac90305849c0cec1301d48c92c27",
     "storage.py": "8ba7b6706cd2790eb4928ef15e65ce6fcd40f7d42b8a5168c6460c3dc2e60c69",
     "ptsl_api.py": "afae8de43adc16229e0775aaefe868cf68243d39645ae82f8171df3bca790e96",
     "analytics.py": "971b559384bb2c1daa297d79a4475611344907c805c578c9632e5e6bc83f9c33",
@@ -51,5 +51,18 @@
     ],
     "live_ui": "Existing saved batch reopened through selector successfully; no corpus or credentials included in source publication.",
     "data_safety": "Private consistent SQLite backup created; no database deletion or reset performed."
+  },
+  "hard_test_2026_11_15": {
+    "tests_passed": 237,
+    "tests_skipped": 1,
+    "large_input_bytes": 20020000,
+    "large_records_ingested_verified_exported": 20000,
+    "complex_records": 331,
+    "mock_endpoint_cases_passed": 17,
+    "mock_endpoint_cases_total": 26,
+    "real_qwen_quality": "NOT ASSESSED: active endpoint is mock",
+    "new_regression_cases": 26,
+    "bug_fixed": "Non-object JSONL row no longer stops ingestion of following valid rows",
+    "results": "docs/HARD_TEST_RESULTS.md"
   }
 }

@@ -356,6 +356,8 @@ def ingest_files(files, prompt_column="", answer_column="", default_origin="huma
                 try:
                     if parse_error:
                         raise ValueError(parse_error)
+                    if not isinstance(obj, dict):
+                        raise ValueError("Input row must be an object.")
                     record["flags"]["damaged_chars"] = any("\ufffd" in str(v) or "\x00" in str(v) for v in obj.values())
                     normalized = normalize_input(obj, prompt_column, answer_column, default_origin)
                     raw_text = canonical_json(normalized.get("messages", [])) if normalized["kind"] == "dialogue" else normalized["text"]

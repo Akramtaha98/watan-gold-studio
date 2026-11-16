@@ -57,6 +57,10 @@ def test_untrusted_model_output_never_auto_passes(monkeypatch,attack):
     if attack=='fences':content='```json\n'+content+'\n```'
     monkeypatch.setattr(w,'request_json',lambda *a,**kw:{'choices':[{'finish_reason':finish,'message':{'content':content}}]})
     w.verify_record(record,CONFIG,POLICY)
+    if attack=='removed_mask':
+        assert record['status']=='PTSL_REVIEW' and record['candidate']==record['original']
+        assert any('PII placeholder' in e for e in record['verification']['result']['policy_errors'])
+        return
     assert record['status']=='ERROR' and record['verification'] is None
     assert record['candidate']==record['original']
     assert 'real@example.my' not in record['reason']

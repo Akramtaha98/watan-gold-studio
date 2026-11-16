@@ -18,7 +18,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 HOST, PORT = '127.0.0.1', 8000
-MODELS = ('Qwen/Qwen3-8B', 'Qwen/Qwen3-32B')
+MODELS = ('qwen3-14b', 'Qwen/Qwen3-8B', 'Qwen/Qwen3-32B')
 CATEGORIES = ('DBP_Grammar', 'WaRiSAN_Identity', 'Safety_Refusal', 'General_BM_QA')
 MAX_BODY_BYTES = 4 * 1024 * 1024
 

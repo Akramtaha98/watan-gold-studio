@@ -182,7 +182,7 @@ def test_minimal_sidebar_and_disabled_holdout_default():
     app=review_app()
     next(x for x in app.radio if x.label=='Workspace Mode').set_value(w.WORKSPACE_MODES[0]).run(timeout=15)
     find_button(app,'Approve').click().run(timeout=15)
-    assert app.session_state['active_step']==3
+    assert app.session_state['active_step']==4
     holdout=next(x for x in app.toggle if 'holdout' in x.label)
     assert holdout.value is False
     assert next(x for x in app.slider if 'holdout' in x.label.lower()).disabled

@@ -19,6 +19,7 @@ import re
 import time
 import unicodedata
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -593,7 +594,7 @@ class QwenConfig:
     api_key: str = ""
     mode: str = "structured_outputs"
     timeout: int = 120
-    max_tokens: int = 8192
+    max_tokens: int = 1536
     target: str = "AUTO"
 
     def public(self):
@@ -827,6 +828,42 @@ def verify_record(record, config, policy):
         except Exception:
             record.update(status="ERROR", reason="Unexpected invalid verification response; retry after checking the server.")
     record["history"].append({"action": "VERIFY", "status": record["status"], "at": now()})
+
+
+def verify_records(records, config, policy, workers=1, on_progress=None):
+    """Verify records concurrently while keeping results deterministic.
+
+    Workers verify private copies. Results are merged back into the original
+    record objects in input order, from the calling thread only, so list order,
+    record identity and persistence snapshots never see half-written records.
+    on_progress(done, total, record) is called from the calling thread.
+    """
+    total = len(records)
+    workers = max(1, min(int(workers or 1), total or 1))
+    if workers == 1:
+        for done, record in enumerate(records, 1):
+            verify_record(record, config, policy)
+            if on_progress:
+                on_progress(done, total, record)
+        return
+    copies = [copy.deepcopy(r) for r in records]
+    finished, cursor, done = set(), 0, 0
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(verify_record, c, config, policy): i for i, c in enumerate(copies)}
+        for future in as_completed(futures):
+            i = futures[future]
+            try:
+                future.result()
+            except Exception:
+                copies[i].update(status="ERROR", reason="Unexpected invalid verification response; retry after checking the server.")
+            finished.add(i)
+            done += 1
+            while cursor in finished:
+                records[cursor].clear()
+                records[cursor].update(copies[cursor])
+                cursor += 1
+            if on_progress:
+                on_progress(done, total, copies[i])
 
 
 def bulk_eligible(record, current_profile):
@@ -1775,7 +1812,7 @@ def main():
         st.session_state.persistence_initialized = True
     for key, value in {"batch": {"records": [], "sources": [], "issues": []}, "upload_signature": None, "release_job": None, "release_key": None, "connection": None, "editing_id": None}.items():
         st.session_state.setdefault(key, value)
-    defaults = {"base_url": os.getenv("QWEN_BASE_URL", "http://127.0.0.1:8000/v1"), "model": os.getenv("QWEN_MODEL", "qwen3-14b"), "gold_version": "v0.1", "reviewer": "Linguist" if st.query_params.get("mode") == "ptsl" else "AI_Engineer", "api_key": os.getenv("QWEN_API_KEY", ""), "mode": "structured_outputs", "timeout": 120, "max_tokens": 8192, "embedding_model": "not_configured", "policy_text": POLICY_PATH.read_text(encoding="utf-8"), "target_label": "Auto-Route All 4 Gold Stages", "holdout_enabled": False, "holdout_pct": 12, "include_conversations": False, "overlap": 64, "prompt_column": "", "answer_column": "", "default_origin": "human", "include_governance": False}
+    defaults = {"base_url": os.getenv("QWEN_BASE_URL", "http://127.0.0.1:8000/v1"), "model": os.getenv("QWEN_MODEL", "qwen3-14b"), "gold_version": "v0.1", "reviewer": "Linguist" if st.query_params.get("mode") == "ptsl" else "AI_Engineer", "api_key": os.getenv("QWEN_API_KEY", ""), "mode": "structured_outputs", "timeout": 120, "max_tokens": 1536, "workers": max(1, min(64, int(os.getenv("QWEN_WORKERS", "12") or 12))), "embedding_model": "not_configured", "policy_text": POLICY_PATH.read_text(encoding="utf-8"), "target_label": "Auto-Route All 4 Gold Stages", "holdout_enabled": False, "holdout_pct": 12, "include_conversations": False, "overlap": 64, "prompt_column": "", "answer_column": "", "default_origin": "human", "include_governance": False}
     settings = st.session_state.setdefault("pipeline_settings", defaults)
     for key, value in defaults.items():
         settings.setdefault(key, value)
@@ -1838,6 +1875,7 @@ def main():
                 ui_setting(st, settings, "mode", "selectbox", "JSON mode", options=["structured_outputs", "json_object", "guided_json"])
                 ui_setting(st, settings, "timeout", "number_input", "Timeout (seconds)", min_value=10, max_value=600)
                 ui_setting(st, settings, "max_tokens", "number_input", "Max output tokens", min_value=512, max_value=32768, step=512)
+                ui_setting(st, settings, "workers", "number_input", "Parallel requests", min_value=1, max_value=64, step=1, help="Concurrent Qwen requests sent to vLLM. Use 1 for single-threaded mocks and tests.")
                 st.caption("enable_thinking=False · temperature=0")
                 ui_setting(st, settings, "embedding_model", "text_input", "Embedding Model Label", help="Metadata only; this app does not generate embeddings.")
                 ui_setting(st, settings, "policy_text", "text_area", "WaRiSAN policy JSON", height=230)
@@ -2010,10 +2048,16 @@ def main():
         if st.button("Run Qwen 3 Verification", type="primary", disabled=not config_valid or not targets, width="stretch", icon=":material/play_arrow:", help="Mask → verify → triage. AUTO_PASS ≥0.95 without errors/edits. Ambiguous, near-Malay and 3R items require review. API failures remain retryable."):
             st.session_state.release_job = None
             progress = st.progress(0, text=f"Verifying 0 / {len(targets)}")
-            for i, record in enumerate(targets, 1):
-                verify_record(record, config, policy)
-                ui_save_persistent_batch(st, store, config, policy, settings)
-                progress.progress(i/len(targets), text=f"{i} / {len(targets)} · {record['id']} · {record['status']}")
+            ticks = {"saved": 0, "shown": 0, "at": time.monotonic()}
+            def on_progress(done, total, record):
+                now_t = time.monotonic()
+                if done == total or done - ticks["saved"] >= 5:
+                    ui_save_persistent_batch(st, store, config, policy, settings)
+                    ticks["saved"] = done
+                if done == total or done - ticks["shown"] >= 5 or now_t - ticks["at"] >= 0.5:
+                    progress.progress(done/total, text=f"{done} / {total} - {record['id']} - {record['status']}")
+                    ticks["shown"], ticks["at"] = done, now_t
+            verify_records(targets, config, policy, int(settings.get("workers", 12) or 1), on_progress)
             st.session_state.connection = {"signature": connection_signature, "ok": any(r.get("verification") for r in targets)}
             st.session_state.verification_finished = True
             pending = ui_verification_targets(records, current_profile)

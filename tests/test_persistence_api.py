@@ -187,19 +187,19 @@ def test_release_rejects_a_changed_batch(monkeypatch):
 def test_restart_ui_restore_and_external_submission_advances(monkeypatch):
     store=Storage();batch_id,*_=create(store,monkeypatch,rows=dialogues(1))
     app=AppTest.from_file(str(APP)).run(timeout=20)
-    assert not app.exception and app.session_state['active_step']==2
+    assert not app.exception and app.session_state['active_step']==3
     assert app.session_state['batch_id']==batch_id
     item=store.queue(batch_id)[0]
     with client(store) as api:assert api.post('/api/ptsl/submit',headers=auth(),json=submit_item(item)).status_code==200
     app.run(timeout=20)
-    assert not app.exception and app.session_state['active_step']==3
+    assert not app.exception and app.session_state['active_step']==4
     assert app.session_state['batch']['records'][0]['status']=='HUMAN_APPROVED'
     assert any(x.label.startswith('Validate & Download') for x in app.get('download_button'))
     app.session_state['release_job'].get_zip();app.run(timeout=20)
     assert not app.exception
     # A brand-new Streamlit session restores the same persisted state and history.
     new=AppTest.from_file(str(APP)).run(timeout=20)
-    assert new.session_state['batch_id']==batch_id and new.session_state['active_step']==3
+    assert new.session_state['batch_id']==batch_id and new.session_state['active_step']==4
     next(x for x in new.toggle if x.label=='Release History').set_value(True).run(timeout=20)
     assert not new.exception and any(x.label=='Download saved release (.zip)' for x in new.get('download_button'))
     find_button(new,'Start new batch').click().run(timeout=20)

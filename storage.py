@@ -34,6 +34,9 @@ releases = Table('releases', metadata, Column('key', String(250), primary_key=Tr
 outbox = Table('webhook_outbox', metadata, Column('id', String(64), primary_key=True), Column('event_type', String(80), nullable=False), Column('payload', JSON, nullable=False), Column('status', String(20), nullable=False), Column('attempts', Integer, nullable=False), Column('next_attempt', Integer, nullable=False), Column('lease', String(64)), Column('created_at', String(40), nullable=False))
 
 
+bronze_registry = Table('bronze_registry', metadata, Column('batch_id', String(64), primary_key=True), Column('sha256', String(64), primary_key=True), Column('filename', String(300), nullable=False), Column('bytes', Integer, nullable=False), Column('ingested_at', String(40), nullable=False), Column('registered_at', String(40), nullable=False))
+
+
 class ConflictError(ValueError):
     """The caller's snapshot is stale; reload instead of overwriting another review."""
 
@@ -72,7 +75,11 @@ def safe_context(context):
 
 def safe_batch(batch):
     import watan_gold_studio as w
-    clean = copy.deepcopy({k: batch[k] for k in ('records', 'sources', 'issues', 'file_aliases', 'ingested_at', 'silver_run_id', 'review_packs') if k in batch})
+    clean = copy.deepcopy({k: batch[k] for k in ('records', 'sources', 'issues', 'file_aliases', 'ingested_at', 'silver_run_id', 'review_packs', 'bronze', 'silver') if k in batch})
+    for entry in clean.get('bronze', []):
+        if not (isinstance(entry, dict) and re.fullmatch(r'[0-9a-f]{64}', str(entry.get('sha256', ''))) and isinstance(entry.get('bytes'), int) and isinstance(entry.get('filename'), str) and isinstance(entry.get('ingested_at'), str)):
+            raise ValueError('Bronze entries need filename, sha256, bytes and ingested_at.')
+        entry['filename'] = w.mask_pii(entry['filename'])[0][:300]
     clean.setdefault('records', []);clean.setdefault('sources', []);clean.setdefault('issues', [])
     ids = set()
     for record in clean['records']:
@@ -133,12 +140,39 @@ class Storage:
                 conn.exec_driver_sql(f'CREATE SCHEMA IF NOT EXISTS "{schema}"')
             self.engine.update_execution_options(schema_translate_map={None:schema})
         metadata.create_all(self.engine)
+        self._bronze_triggers()
         with self.write() as conn:
             found = conn.execute(select(versions.c.version)).scalars().all()
             if not found:conn.execute(insert(versions).values(version=SCHEMA_VERSION))
             elif found != [SCHEMA_VERSION]:raise ValueError('Unsupported database schema; run an approved migration before startup.')
         if self.engine.dialect.name == 'sqlite' and self.engine.url.database not in {None, '', ':memory:'}:
             os.chmod(self.engine.url.database, 0o600)
+
+    def _bronze_triggers(self):
+        """Bronze rows are append-only: the database itself rejects UPDATE and DELETE."""
+        message = 'bronze_registry is immutable'
+        with self.engine.begin() as conn:
+            if self.engine.dialect.name == 'sqlite':
+                for action in ('UPDATE', 'DELETE'):
+                    conn.exec_driver_sql(f"CREATE TRIGGER IF NOT EXISTS bronze_registry_no_{action.lower()} BEFORE {action} ON bronze_registry BEGIN SELECT RAISE(ABORT, '{message}'); END")
+            elif self.engine.dialect.name == 'postgresql':
+                schema = os.getenv('DATABASE_SCHEMA', 'warisan')
+                conn.exec_driver_sql(f'CREATE OR REPLACE FUNCTION "{schema}".bronze_registry_immutable() RETURNS trigger AS $$ BEGIN RAISE EXCEPTION \'{message}\'; END; $$ LANGUAGE plpgsql')
+                conn.exec_driver_sql(f'DROP TRIGGER IF EXISTS bronze_registry_immutable ON "{schema}".bronze_registry')
+                conn.exec_driver_sql(f'CREATE TRIGGER bronze_registry_immutable BEFORE UPDATE OR DELETE ON "{schema}".bronze_registry FOR EACH ROW EXECUTE FUNCTION "{schema}".bronze_registry_immutable()')
+
+    @staticmethod
+    def _register_bronze(conn, batch_id, batch):
+        for entry in batch.get('bronze', []):
+            found = conn.execute(select(bronze_registry.c.sha256).where(bronze_registry.c.batch_id == batch_id, bronze_registry.c.sha256 == entry['sha256'])).first()
+            if not found:
+                conn.execute(insert(bronze_registry).values(batch_id=batch_id, sha256=entry['sha256'], filename=entry['filename'], bytes=entry['bytes'], ingested_at=entry['ingested_at'], registered_at=utcnow()))
+
+    def list_bronze(self, batch_id=None):
+        query = select(bronze_registry).order_by(bronze_registry.c.registered_at, bronze_registry.c.sha256)
+        if batch_id:query = query.where(bronze_registry.c.batch_id == batch_id)
+        with self.engine.connect() as conn:
+            return [dict(row) for row in conn.execute(query).mappings()]
 
     @contextmanager
     def write(self):
@@ -177,6 +211,7 @@ class Storage:
         with self.write() as conn:
             conn.execute(insert(batches).values(id=batch_id, revision=1, snapshot=batch, context=context, created_at=utcnow(), updated_at=utcnow()))
             self._store_rows(conn, batch_id, batch)
+            self._register_bronze(conn, batch_id, batch)
             self._event(conn, 'batch.created', {'batch_id': batch_id, 'records': len(batch['records'])})
         return batch_id, 1
 
@@ -200,6 +235,7 @@ class Storage:
             revision = expected_revision + 1
             conn.execute(update(batches).where(batches.c.id == batch_id).values(snapshot=batch, context=context, revision=revision, updated_at=utcnow()))
             self._store_rows(conn, batch_id, batch)
+            self._register_bronze(conn, batch_id, batch)
             self._event(conn, 'batch.updated', {'batch_id': batch_id, **self._progress(batch,context)})
         return revision
 

@@ -85,7 +85,7 @@ def test_stale_initial_autoload_in_reviewer_mode_does_not_rerun_forever(monkeypa
 def test_portal_status_race_recovers_without_a_traceback(monkeypatch):
     store=Storage();batch_id,*_=create(store,monkeypatch,rows=dialogues(1))
     app=AppTest.from_file(str(APP)).run(timeout=20)
-    assert not app.exception and app.session_state['active_step']==2
+    assert not app.exception and app.session_state['active_step']==3
     snapshot=copy.deepcopy(app.session_state['batch']['records'])
     def missing(*args):raise KeyError('Batch not found')
     monkeypatch.setattr(Storage,'status',missing)

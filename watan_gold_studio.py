@@ -28,6 +28,8 @@ from urllib.parse import urlsplit
 import requests
 from jsonschema import Draft202012Validator
 
+import silver
+
 MAX_FILE_BYTES = 25 * 1024 * 1024
 MAX_RECORDS = 20_000
 MAX_RECORD_CHARS = 48_000
@@ -332,9 +334,14 @@ def read_rows(name, data):
         raise ValueError("Supported files: JSONL, XLSX, CSV, Parquet, TXT, DOCX and PDF.")
 
 
-def ingest_files(files, prompt_column="", answer_column="", default_origin="human"):
-    """files = [(name, bytes), ...]. Persist only masked rows and hash provenance."""
-    records, sources, issues, file_aliases = [], [], [], []
+def ingest_files(files, prompt_column="", answer_column="", default_origin="human", silver_rules=None, near_dup_threshold=None):
+    """files = [(name, bytes), ...]. Persist only masked rows and hash provenance.
+
+    Stage 0 (Bronze): every distinct raw file gets an immutable SHA-256/size/name/UTC entry; bytes are never modified.
+    Stage 1 (Silver): optional rule cleaning (silver_rules from silver.parse_rules) and MinHash near-duplicate grouping.
+    """
+    records, sources, issues, file_aliases, bronze = [], [], [], [], []
+    ingested_at = now()
     seen_files = set()
     for file_index, (name, data) in enumerate(files, 1):
         fingerprint = sha256(data)
@@ -344,6 +351,7 @@ def ingest_files(files, prompt_column="", answer_column="", default_origin="huma
             issues.append(f"{safe_name}: identical file skipped (SHA-256 match).")
             continue
         seen_files.add(fingerprint)
+        bronze.append(silver.bronze_entry(safe_name, data, ingested_at))
         source = {"source_id": f"F{file_index:03d}", "name": safe_name, "sha256": fingerprint, "bytes": len(data), "rows": 0}
         sources.append(source)
         if len(data) > MAX_FILE_BYTES:
@@ -361,6 +369,18 @@ def ingest_files(files, prompt_column="", answer_column="", default_origin="huma
                         raise ValueError("Input row must be an object.")
                     record["flags"]["damaged_chars"] = any("\ufffd" in str(v) or "\x00" in str(v) for v in obj.values())
                     normalized = normalize_input(obj, prompt_column, answer_column, default_origin)
+                    silver_applied = []
+                    silver_messy = normalized["kind"] != "dialogue" and silver.is_messy(normalized.get("text", ""), name)
+                    if silver_rules:
+                        if normalized["kind"] == "dialogue":
+                            cleaned_turns = []
+                            for turn in normalized["messages"]:
+                                content, applied = silver.silver_clean(turn["content"], silver_rules)
+                                cleaned_turns.append({**turn, "content": content})
+                                silver_applied.extend(applied)
+                            normalized["messages"] = cleaned_turns
+                        else:
+                            normalized["text"], silver_applied = silver.silver_clean(normalized["text"], silver_rules)
                     raw_text = canonical_json(normalized.get("messages", [])) if normalized["kind"] == "dialogue" else normalized["text"]
                     exemptions = allowed_synthetic_values(raw_text, normalized["allowlist_synthetic_pii"], normalized["origin_type"])
                     record["synthetic_pii_values"] = exemptions
@@ -393,6 +413,7 @@ def ingest_files(files, prompt_column="", answer_column="", default_origin="huma
                     record["source_lang_near_malay"] = source_near
                     record["flags"]["lang_near_malay"] = source_near
                     record.update(original=masked, candidate=copy.deepcopy(masked), original_text=text, text=text, kind=normalized["kind"], meta=metadata, origin_type=normalized["origin_type"], origin_declared=normalized["origin_declared"], eval_tag=normalized["eval_tag"], stage=None, category="General_BM_QA", status="PENDING", mask_counts=dict(masks))
+                    record["silver"] = {"cleaned": bool(silver_rules), "applied": sorted(set(silver_applied)), "messy": bool(silver_messy), "paragraphs": len(silver.segment_paragraphs(text)) if normalized["kind"] != "dialogue" else 0}
                 except (ValueError, TypeError):
                     # Do not keep bad raw payloads or exception values containing uploaded text.
                     record["reason"] = parse_error or "Invalid conversation structure, missing fields or corrupted text. Check the source row."
@@ -423,7 +444,12 @@ def ingest_files(files, prompt_column="", answer_column="", default_origin="huma
             for r in group:
                 if r is not representative:
                     r.update(status="DUPLICATE", duplicate_of_id=representative["id"], reason=f"Identical masked prompt/text; representative {representative['id']}.")
-    return {"records": records, "sources": sources, "issues": issues, "file_aliases": file_aliases, "ingested_at": now()}
+    near = {"enabled": bool(near_dup_threshold), "threshold": near_dup_threshold, "shingle_size": 5, "groups": 0, "records": 0}
+    if near_dup_threshold:
+        groups = mark_near_duplicates(records, near_dup_threshold)
+        near.update(groups=len(groups), records=sum(len(g["members"]) for g in groups))
+    silver_meta = {"cleaning_enabled": bool(silver_rules), "rules": silver_rules, "rules_sha256": silver.rules_sha256(silver_rules) if silver_rules else None, "near_duplicate": near, "agent1": {"enabled": False}}
+    return {"records": records, "sources": sources, "issues": issues, "file_aliases": file_aliases, "ingested_at": ingested_at, "bronze": bronze, "silver": silver_meta}
 
 
 STAGES = ("GOLD_1", "GOLD_2", "GOLD_3", "GOLD_4")
@@ -798,6 +824,8 @@ def classify(original, result):
         return "QUARANTINE"
     if result["confidence"] < REVIEW_THRESHOLD:
         return "QUARANTINE"
+    if record.get("near_duplicate_of"):
+        return "PTSL_REVIEW"
     edited = result["messages"] != record["original"] if record.get("kind", "dialogue") == "dialogue" else result["text"] != record["original_text"]
     if result["confidence"] >= PASS_THRESHOLD and not any(result[k] for k in ("dbp_errors", "policy_errors", "factual_errors")) and not edited:
         return "AUTO_PASS"
@@ -864,6 +892,205 @@ def verify_records(records, config, policy, workers=1, on_progress=None):
                 cursor += 1
             if on_progress:
                 on_progress(done, total, copies[i])
+
+
+# ---------------------------------------------------------------------------
+# WaRiSAN pipeline: Bronze -> Silver (rules + Agent 1 + MinHash) -> Quality Gate
+# (Qwen Agent 2) -> PTSL Review -> Gold. See docs/PIPELINE_ALIGNMENT.md.
+# ---------------------------------------------------------------------------
+GATE_ORDER = ("PASS", "WARN", "REVIEW", "BLOCK")
+GATE_BADGES = {"PASS": "🟢 PASS", "WARN": "🟡 WARN", "REVIEW": "🟠 REVIEW", "BLOCK": "🔴 BLOCK", "DUPLICATE": "⚪ DUPLICATE", "PENDING": "⚪ PENDING"}
+GATE_MAPPING = {"AUTO_PASS": "PASS", "HUMAN_APPROVED": "PASS", "PTSL_REVIEW": "REVIEW (WARN when only minor flags)", "QUARANTINE": "BLOCK", "ERROR": "BLOCK"}
+HELD_REASON = "Silver rules and MinHash passed; held at Silver (not sampled for Agent 2)."
+AGENT1_NAME = "Format & Extraction Agent"
+AGENT1_MAX_CHARS = 6000
+AGENT1_SCHEMA = object_schema({
+    "paragraphs": {"type": "array", "items": STRING},
+    "qa_pairs": {"type": "array", "items": object_schema({"question": STRING, "answer": STRING})},
+    "structure": object_schema({"content_type": {"type": "string", "enum": ["prose", "qa", "list", "table", "mixed"]}, "heading": NULLABLE_STRING, "page_number": NULLABLE_STRING}),
+})
+AGENT1_SYSTEM = (
+    "You are the WaRiSAN Format & Extraction Agent (Silver stage). You receive one noisy document extract as JSON and return JSON only. "
+    "Restructure; never rewrite. 1) Join lines broken by hard line wraps, rejoin words split by a hyphen at a line break, and drop isolated page numbers and running headers or footers. "
+    "2) Return the cleaned text as an ordered list of paragraphs. "
+    "3) Do not add, translate, correct, paraphrase or remove any word or fact; keep every spelling exactly as in the source. "
+    "4) Keep the placeholders <IC>, <PHONE> and <EMAIL> exactly as they appear. "
+    "5) If the text contains explicit question-and-answer pairs, copy each pair verbatim into qa_pairs; otherwise return an empty qa_pairs list. "
+    "6) structure.content_type is one of prose, qa, list, table, mixed; heading is the section or document heading if present, else null; page_number is the page label if stated, else null.")
+
+
+def mark_near_duplicates(records, threshold=0.85):
+    """Stage 1: MinHash/LSH near-duplicate grouping over records still PENDING after exact dedupe."""
+    items = [(r["id"], r["text"] if r["kind"] != "dialogue" else "\n".join(t["content"] for t in r["original"])) for r in records if r["status"] == "PENDING"]
+    groups = silver.find_near_duplicates(items, threshold)
+    by_id = {r["id"]: r for r in records}
+    for group in groups:
+        by_id[group["representative"]]["near_duplicate_group_id"] = group["group_id"]
+        for member in group["members"]:
+            by_id[member["key"]].update(near_duplicate_group_id=group["group_id"], near_duplicate_of=group["representative"], near_duplicate_jaccard=member["jaccard"])
+    return groups
+
+
+def agent1_call(record, config):
+    text = record["original_text"]
+    if pii_leaks(text):
+        raise ValueError("Unmasked PII; Agent 1 transmission blocked.")
+    payload = {"model": config.model, "messages": [{"role": "system", "content": AGENT1_SYSTEM}, {"role": "user", "content": canonical_json({"source": record.get("meta", {}).get("source", ""), "text": text})}],
+               "temperature": 0, "max_tokens": max(config.max_tokens, min(4096, len(text) // 2 + 512)), "chat_template_kwargs": {"enable_thinking": False}, "stream": False}
+    if config.mode == "structured_outputs":
+        payload["structured_outputs"] = {"json": server_schema(AGENT1_SCHEMA)}
+    elif config.mode == "guided_json":
+        payload["guided_json"] = AGENT1_SCHEMA
+    elif config.mode == "json_object":
+        payload["response_format"] = {"type": "json_object"}
+    else:
+        raise ValueError("Unsupported JSON mode.")
+    choice = request_json(config, "/chat/completions", payload)["choices"][0]
+    if choice["finish_reason"] != "stop":
+        raise ValueError("Incomplete response.")
+    data = strict_json(choice["message"]["content"])
+    Draft202012Validator(AGENT1_SCHEMA).validate(data)
+    return data
+
+
+def agent1_process(record, config):
+    """Return an outcome dict; never mutates the record and never raises."""
+    text = record["original_text"]
+    try:
+        data = agent1_call(record, config)
+    except Exception:
+        return {"status": "error", "reason": "Agent 1 call failed; rules-cleaned text kept for Agent 2."}
+    ok, reason, paragraphs, qa_pairs = silver.validate_agent1_output(text, data["paragraphs"], data["qa_pairs"])
+    if not ok:
+        return {"status": "rejected", "reason": reason}
+    new_text = "\n\n".join(paragraphs)
+    try:
+        validate_prose(new_text)
+    except ValueError:
+        return {"status": "rejected", "reason": "Agent 1 output failed prose validation."}
+    structure = {k: (mask_pii(v)[0] if isinstance(v, str) else v) for k, v in data["structure"].items()}
+    return {"status": "applied", "text": new_text, "paragraphs": len(paragraphs), "qa_pairs": qa_pairs[:50], "structure": structure}
+
+
+def agent1_apply(record, outcome, config):
+    info = {"agent": AGENT1_NAME, "model": config.model, "status": outcome["status"], "at": now()}
+    if outcome["status"] == "applied":
+        before = record["original_text"]
+        record["original_text"] = record["text"] = outcome["text"]
+        record["silver"]["paragraphs"] = outcome["paragraphs"]
+        info.update(before_sha256=sha256(before), after_sha256=sha256(outcome["text"]), paragraphs=outcome["paragraphs"], qa_pairs=outcome["qa_pairs"], structure=outcome["structure"])
+    else:
+        info["reason"] = outcome["reason"]
+    record.setdefault("silver", {})["agent1"] = info
+
+
+def agent1_eligible(record):
+    return record["status"] == "PENDING" and record.get("kind") == "prose" and record.get("silver", {}).get("messy") and "agent1" not in record.get("silver", {}) and len(record.get("original_text", "")) <= AGENT1_MAX_CHARS
+
+
+def run_agent1(batch, config, workers=1, on_progress=None):
+    """Stage 1 Agent 1: restructure only messy prose records, concurrently, merging results on the calling thread."""
+    eligible = [r for r in batch["records"] if agent1_eligible(r)]
+    outcomes = silver.parallel_map(lambda r: agent1_process(r, config), eligible, workers, on_progress)
+    for record, outcome in zip(eligible, outcomes):
+        agent1_apply(record, outcome, config)
+    counts = Counter(o["status"] for o in outcomes)
+    batch.setdefault("silver", {})["agent1"] = {"enabled": True, "agent": AGENT1_NAME, "model": config.model, "eligible": len(eligible), **{k: counts.get(k, 0) for k in ("applied", "rejected", "error")}}
+    return batch["silver"]["agent1"]
+
+
+def silver_warnings(record):
+    """Minor Silver-stage causes that route a record to human review as WARN."""
+    meta, flags = record.get("meta", {}), record.get("flags", {})
+    out = []
+    if record.get("near_duplicate_of"):
+        out.append("near_duplicate")
+    if record.get("silver", {}).get("agent1", {}).get("status") in {"rejected", "error"}:
+        out.append("agent1_" + record["silver"]["agent1"]["status"])
+    if record.get("seed_hygiene_flags"):
+        out.append("seed_hygiene")
+    if meta.get("dialect_flag") or meta.get("old_spelling") or meta.get("spelling_variant") or meta.get("script") == "jawi":
+        out.append("variant")
+    if record.get("source_lang_near_malay") or flags.get("lang_near_malay"):
+        out.append("near_malay")
+    return out
+
+
+def gate_reasons(record):
+    result = (record.get("verification") or {}).get("result") or {}
+    out = list(silver_warnings(record))
+    if result.get("dialect_flag") or result.get("script") == "jawi" or result.get("spelling_variant") == "normalised":
+        out.append("variant")
+    return sorted(set(out))
+
+
+def gate_warn_only(record):
+    result = (record.get("verification") or {}).get("result")
+    if not result:
+        return False
+    if result["unsafe"] or result["corrupted"] or result["damaged_chars"] or result["explicit_content"] or result["three_r"] or any(result[k] for k in ("dbp_errors", "policy_errors", "factual_errors")):
+        return False
+    if result["confidence"] < REVIEW_THRESHOLD:
+        return False
+    return bool(gate_reasons(record)) or result["confidence"] >= PASS_THRESHOLD
+
+
+def gate_outcome(record):
+    """Quality Gate label for a record: PASS / WARN / REVIEW / BLOCK (plus DUPLICATE / PENDING)."""
+    status = record.get("status")
+    if status in {"AUTO_PASS", "HUMAN_APPROVED"}:
+        return "PASS"
+    if status in {"QUARANTINE", "ERROR"}:
+        return "BLOCK"
+    if status == "PTSL_REVIEW":
+        return "WARN" if gate_warn_only(record) else "REVIEW"
+    return status if status in {"DUPLICATE", "PENDING"} else "PENDING"
+
+
+def gate_counts(records):
+    counts = Counter(gate_outcome(r) for r in records)
+    return {key: counts.get(key, 0) for key in (*GATE_ORDER, "DUPLICATE", "PENDING")}
+
+
+def sampling_candidate(record):
+    """Rules + MinHash outcome: does this record deserve Agent 2 and PTSL attention?"""
+    return bool(silver_warnings(record) or record.get("silver", {}).get("messy") or record.get("silver", {}).get("agent1", {}).get("status") == "applied" or record.get("flags", {}).get("damaged_chars"))
+
+
+def apply_sampling(records, enabled=False, sample_pct=10):
+    """Silver-to-PTSL sampling filter. Rules and MinHash already ran on every record; with the filter on, only
+    WARN/REVIEW candidates plus a deterministic sample_pct% of clean records go to Agent 2. The rest are held at Silver."""
+    counts = {"enabled": bool(enabled), "sample_pct": sample_pct, "candidates": 0, "sampled": 0, "held": 0}
+    for record in records:
+        if record["status"] != "PENDING":
+            continue
+        if not enabled:
+            record.pop("sampling", None)
+            if record.get("reason") == HELD_REASON:
+                record["reason"] = ""
+            continue
+        if sampling_candidate(record):
+            record["sampling"], counts["candidates"] = "selected", counts["candidates"] + 1
+        elif int(sha256(record["id"] + str(record.get("source_sha256", "")))[:8], 16) / 0xFFFFFFFF * 100 < float(sample_pct):
+            record["sampling"], counts["sampled"] = "selected", counts["sampled"] + 1
+        else:
+            record.update(sampling="held", reason=HELD_REASON)
+            counts["held"] += 1
+    return counts
+
+
+def pipeline_summary(batch):
+    """Machine-readable Bronze -> Silver -> Quality Gate summary written into manifest.json."""
+    rows = batch["records"]
+    meta = batch.get("silver", {})
+    applied = Counter(rule for r in rows for rule in r.get("silver", {}).get("applied", []))
+    agent1 = Counter(r["silver"]["agent1"]["status"] for r in rows if r.get("silver", {}).get("agent1"))
+    return {"stages": ["bronze", "silver", "quality_gate", "ptsl_review", "gold"],
+            "bronze": {"registry": "bronze_registry (append-only)", "files": batch.get("bronze", [])},
+            "silver": {"cleaning_enabled": meta.get("cleaning_enabled", False), "rules_sha256": meta.get("rules_sha256"), "rules_applied_counts": dict(applied),
+                       "near_duplicate": meta.get("near_duplicate", {"enabled": False}), "agent1": {**meta.get("agent1", {"enabled": False}), "record_status_counts": dict(agent1)}, "sampling": meta.get("sampling", {"enabled": False})},
+            "quality_gate": {"counts": gate_counts(rows), "status_mapping": GATE_MAPPING,
+                             "records": [{"record_id": r["id"], "gate": gate_outcome(r), "reasons": gate_reasons(r)} for r in rows]}}
 
 
 def bulk_eligible(record, current_profile):
@@ -1514,7 +1741,7 @@ def build_exports(batch, config, policy, fraction=.12, tokenizer=None, overlap=6
     if any(c["short_source"] for c in chunk_audit):warnings.append("Short source sections remain intact below 300 tokens.")
     if any(row["embedding_model"]=="not_configured" for row in restored_tables["GOLD_2"]):warnings.append("Embedding model metadata is not configured; no embeddings are produced by this app.")
     file_info={name:{"sha256":sha256(data),"bytes":len(data),"rows":len(pq.read_table(io.BytesIO(data))) if name.endswith('.parquet') else len(data.decode().splitlines())} for name,data in files.items()}
-    manifest={"manifest_version":4,"silver_run_id":run_id,"silver_run_ids":sorted(set(declared_runs) | {r["silver_run_id"] for r in tables["GOLD_1"]+synthetic_tables["GOLD_1"]}) or [run_id],"gold_version":gold_version,
+    manifest={"manifest_version":5,"pipeline":pipeline_summary(batch),"silver_run_id":run_id,"silver_run_ids":sorted(set(declared_runs) | {r["silver_run_id"] for r in tables["GOLD_1"]+synthetic_tables["GOLD_1"]}) or [run_id],"gold_version":gold_version,
         "release_id":"wr-"+sha256(canonical_json([current,gold_version,fraction,holdout_enabled,include_conversations,overlap,embedding_model,file_info]))[:20],"generated_at":now(),
         "source_code_sha256":sha256(Path(__file__).read_bytes()),"code_commit":None,"files":file_info,"row_counts":{name:v['rows'] for name,v in file_info.items()},
         "sources":[{k:v for k,v in source.items() if k!='name'} for source in batch['sources']],"source_status_counts":dict(Counter(r['status'] for r in batch['records'])),
@@ -1590,7 +1817,7 @@ def render_turns(st, turns):
 
 # UI-only workflow helpers. Corpus validation/review/export functions above stay unchanged.
 WORKSPACE_MODES = ("Full Pipeline Mode", "PTSL Reviewer Only Mode")
-STEP_LABELS = ("Upload & Verify", "PTSL Human Review", "Validate & Export")
+STEP_LABELS = ("Bronze & Silver (Extract + MinHash)", "Quality Gate (Qwen Agent 2)", "PTSL Human Review", "Gold Release")
 
 
 def ui_setting(st, settings, name, control, label, **kwargs):
@@ -1604,26 +1831,26 @@ def ui_setting(st, settings, name, control, label, **kwargs):
 
 
 def ui_verification_targets(records, current_profile):
-    return [r for r in records if r["status"] in {"PENDING", "ERROR"} or (r.get("verification") and r["verification"]["profile_sha256"] != current_profile and r["status"] != "DUPLICATE") or (r["status"] == "QUARANTINE" and r["history"] and r["history"][-1].get("action") == "VERIFY" and not r.get("verification"))]
+    return [r for r in records if r["status"] == "ERROR" or (r["status"] == "PENDING" and r.get("sampling") != "held") or (r.get("verification") and r["verification"]["profile_sha256"] != current_profile and r["status"] != "DUPLICATE") or (r["status"] == "QUARANTINE" and r["history"] and r["history"][-1].get("action") == "VERIFY" and not r.get("verification"))]
 
 
 def ui_after_review(st, records):
     """Completion always uses the entire queue, never the currently selected filter."""
     st.session_state.release_job, st.session_state.editing_id = None, None
     if not any(r["status"] == "PTSL_REVIEW" for r in records):
-        st.session_state.active_step = 3
+        st.session_state.active_step = 4
         st.session_state.review_completion_notice = True
 
 
 def ui_stepper(st, active, completed, reachable):
-    for number, (column, label) in enumerate(zip(st.columns(3), STEP_LABELS), 1):
+    for number, (column, label) in enumerate(zip(st.columns(4), STEP_LABELS), 1):
         status = "Completed ✓" if number in completed else "Active ●" if number == active else "Pending ○"
         with column:
             if st.button(f"{number}. {label}", key=f"wizard_step_{number}", disabled=number not in reachable, type="primary" if number == active else "secondary", width="stretch", help="Return to this step" if number in completed else "Complete the preceding step to continue" if number not in reachable else "Current workflow step"):
                 st.session_state.active_step = number
                 st.rerun()
             st.caption(status)
-    st.progress(len(completed) / 3, text=f"Step {active} of 3 · {STEP_LABELS[active-1]}")
+    st.progress(len(completed) / 4, text=f"Step {active} of 4 · {STEP_LABELS[active-1]}")
 
 
 def ui_context(config, policy, settings):
@@ -1812,7 +2039,7 @@ def main():
         st.session_state.persistence_initialized = True
     for key, value in {"batch": {"records": [], "sources": [], "issues": []}, "upload_signature": None, "release_job": None, "release_key": None, "connection": None, "editing_id": None}.items():
         st.session_state.setdefault(key, value)
-    defaults = {"base_url": os.getenv("QWEN_BASE_URL", "http://127.0.0.1:8000/v1"), "model": os.getenv("QWEN_MODEL", "qwen3-14b"), "gold_version": "v0.1", "reviewer": "Linguist" if st.query_params.get("mode") == "ptsl" else "AI_Engineer", "api_key": os.getenv("QWEN_API_KEY", ""), "mode": "structured_outputs", "timeout": 120, "max_tokens": 1536, "workers": max(1, min(64, int(os.getenv("QWEN_WORKERS", "12") or 12))), "embedding_model": "not_configured", "policy_text": POLICY_PATH.read_text(encoding="utf-8"), "target_label": "Auto-Route All 4 Gold Stages", "holdout_enabled": False, "holdout_pct": 12, "include_conversations": False, "overlap": 64, "prompt_column": "", "answer_column": "", "default_origin": "human", "include_governance": False}
+    defaults = {"base_url": os.getenv("QWEN_BASE_URL", "http://127.0.0.1:8000/v1"), "model": os.getenv("QWEN_MODEL", "qwen3-14b"), "gold_version": "v0.1", "reviewer": "Linguist" if st.query_params.get("mode") == "ptsl" else "AI_Engineer", "api_key": os.getenv("QWEN_API_KEY", ""), "mode": "structured_outputs", "timeout": 120, "max_tokens": 1536, "workers": max(1, min(64, int(os.getenv("QWEN_WORKERS", "12") or 12))), "embedding_model": "not_configured", "policy_text": POLICY_PATH.read_text(encoding="utf-8"), "target_label": "Auto-Route All 4 Gold Stages", "holdout_enabled": False, "holdout_pct": 12, "include_conversations": False, "overlap": 64, "prompt_column": "", "answer_column": "", "default_origin": "human", "include_governance": False, "silver_enabled": True, "silver_yaml": silver.DEFAULT_SILVER_YAML, "near_dup_enabled": True, "near_dup_threshold": 0.85, "agent1_enabled": False, "sampling_enabled": False, "sample_pct": 10}
     settings = st.session_state.setdefault("pipeline_settings", defaults)
     for key, value in defaults.items():
         settings.setdefault(key, value)
@@ -1953,7 +2180,7 @@ def main():
         st.session_state.active_step = 1
         st.session_state.review_completion_notice = bool(st.session_state.pop("pending_review_completion",False))
         if st.session_state.verification_finished and not ui_verification_targets(records, current_profile):
-            st.session_state.active_step = 2 if any(r["status"] == "PTSL_REVIEW" for r in records) else 3
+            st.session_state.active_step = 3 if any(r["status"] == "PTSL_REVIEW" for r in records) else 4
     if st.session_state.get("sync_notice"):
         st.info(st.session_state.pop("sync_notice"))
     if st.session_state.get("batch_id") and config_valid:
@@ -1965,12 +2192,12 @@ def main():
         st.session_state.review_was_queued = True
     reviewed_count = sum(r["status"] != "PTSL_REVIEW" and any(h.get("action") in {"APPROVE", "QUARANTINE"} for h in r.get("history", [])) for r in records)
     verified = bool(st.session_state.verification_finished and not targets and config_valid)
-    completed = ({1} if verified else set()) | ({2} if verified and not queue_count else set())
+    completed = ({1, 2} if verified else set()) | ({3} if verified and not queue_count else set())
     if st.session_state.release_job and st.session_state.release_job.status == "ready" and verified and not queue_count:
-        completed.add(3)
-    reachable = {1} | ({2} if verified or queue_count else set()) | ({3} if verified and not queue_count else set())
+        completed.add(4)
+    reachable = {1} | ({2} if verified else set()) | ({3} if verified or queue_count else set()) | ({4} if verified and not queue_count else set())
     if reviewer_only:
-        st.session_state.active_step = 2 if queue_count or not verified else 3
+        st.session_state.active_step = 3 if queue_count or not verified else 4
     elif st.session_state.get("active_step", 1) not in reachable:
         st.session_state.active_step = 1 if not verified else 2
     active_step = st.session_state.active_step
@@ -1981,12 +2208,12 @@ def main():
             col.metric(label, value, border=True)
     else:
         st.caption("Upload. Verify. Review. Release.")
-        @st.fragment(run_every=1 if active_step == 3 else None)
+        @st.fragment(run_every=1 if active_step == 4 else None)
         def navigation():
-            live_completed = completed - {3}
+            live_completed = completed - {4}
             job = st.session_state.release_job
             if job and job.status == "ready" and verified and not queue_count:
-                live_completed.add(3)
+                live_completed.add(4)
             ui_stepper(st, active_step, live_completed, reachable)
         navigation()
     if st.session_state.get("review_completion_notice") and not reviewer_only:
@@ -2035,10 +2262,31 @@ def main():
                 answer_col = ui_setting(st, settings, "answer_column", "text_input", "Answer column (optional)")
             default_origin = ui_setting(st, settings, "default_origin", "selectbox", "Origin of unlabelled records", options=["human", "synthetic"], help="A source declaration, not AI-authorship detection. An explicit origin_type field overrides this default.")
             st.caption("Text fields: text / paragraph_text / body / content. Dialogue: messages / conversations or prompt + response. Retain source, license, paragraph_ids and page_number fields where available.")
-        signature = sha256(canonical_json({"files": [(u.name, sha256(u.getvalue())) for u in uploads], "columns": [prompt_col, answer_col], "default_origin": default_origin})) if uploads else None
-        if signature and signature != st.session_state.upload_signature:
+        with st.expander("Silver options: rules, MinHash, Agent 1, sampling", expanded=False):
+            ui_setting(st, settings, "silver_enabled", "toggle", "Rule-based Silver cleaning", help="Unicode normalisation, control-character stripping, whitespace normalisation and structural paragraph segmentation. Raw files are never modified.")
+            ui_setting(st, settings, "silver_yaml", "text_area", "Silver rules (YAML)", height=170, disabled=not settings["silver_enabled"])
+            ui_setting(st, settings, "near_dup_enabled", "toggle", "MinHash near-duplicate detection", help="5-shingle MinHash/LSH grouping next to the exact-hash dedupe. Near-duplicate members are routed to human review as WARN.")
+            ui_setting(st, settings, "near_dup_threshold", "slider", "Near-duplicate Jaccard threshold", min_value=0.5, max_value=1.0, step=0.01, disabled=not settings["near_dup_enabled"])
+            ui_setting(st, settings, "agent1_enabled", "toggle", "Enable AI Agent 1 for messy PDF/DOCX restructuring", help="Format & Extraction Agent (Qwen3-14B): rejoins broken line wraps, extracts clean paragraphs or Q&A pairs and tags structure. Output is rejected if it adds words or alters PII placeholders.")
+            ui_setting(st, settings, "sampling_enabled", "toggle", "Silver-to-PTSL sampling filter", help="Rules and MinHash run on every record. Only WARN/REVIEW candidates plus the sample below go to Qwen Agent 2 and PTSL; the rest are held at Silver, not released to Gold.")
+            ui_setting(st, settings, "sample_pct", "number_input", "Sample of clean records sent to Agent 2 (%)", min_value=0, max_value=100, step=5, disabled=not settings["sampling_enabled"])
+        silver_rules, silver_error = None, None
+        if settings["silver_enabled"]:
+            try:
+                silver_rules = silver.parse_rules(settings["silver_yaml"])
+            except ValueError as exc:
+                silver_error = str(exc)
+                st.error(silver_error)
+        near_threshold = float(settings["near_dup_threshold"]) if settings["near_dup_enabled"] else None
+        signature = sha256(canonical_json({"files": [(u.name, sha256(u.getvalue())) for u in uploads], "columns": [prompt_col, answer_col], "default_origin": default_origin, "silver": [bool(settings["silver_enabled"]), settings["silver_yaml"] if settings["silver_enabled"] else "", near_threshold, bool(settings["agent1_enabled"])]})) if uploads else None
+        if signature and signature != st.session_state.upload_signature and not silver_error:
             with st.spinner("Preparing masked Silver records…"):
-                st.session_state.batch = ingest_files([(u.name, u.getvalue()) for u in uploads], prompt_col.strip(), answer_col.strip(), default_origin)
+                st.session_state.batch = ingest_files([(u.name, u.getvalue()) for u in uploads], prompt_col.strip(), answer_col.strip(), default_origin, silver_rules, near_threshold)
+                if settings["agent1_enabled"]:
+                    if config_valid:
+                        run_agent1(st.session_state.batch, config, int(settings.get("workers", 12) or 1))
+                    else:
+                        st.session_state.batch["silver"]["agent1"] = {"enabled": True, "eligible": 0, "error": "Connection settings invalid; Agent 1 skipped."}
                 ui_save_persistent_batch(st, store, config, policy, settings, new=True)
                 st.session_state.upload_signature = signature
                 st.session_state.release_job, st.session_state.editing_id = None, None
@@ -2047,6 +2295,8 @@ def main():
             st.caption("Your current batch is retained. Upload a different file to start a new batch.")
         if st.button("Run Qwen 3 Verification", type="primary", disabled=not config_valid or not targets, width="stretch", icon=":material/play_arrow:", help="Mask → verify → triage. AUTO_PASS ≥0.95 without errors/edits. Ambiguous, near-Malay and 3R items require review. API failures remain retryable."):
             st.session_state.release_job = None
+            batch.setdefault("silver", {})["sampling"] = apply_sampling(records, settings["sampling_enabled"], settings["sample_pct"])
+            targets = ui_verification_targets(records, current_profile)
             progress = st.progress(0, text=f"Verifying 0 / {len(targets)}")
             ticks = {"saved": 0, "shown": 0, "at": time.monotonic()}
             def on_progress(done, total, record):
@@ -2061,7 +2311,7 @@ def main():
             st.session_state.connection = {"signature": connection_signature, "ok": any(r.get("verification") for r in targets)}
             st.session_state.verification_finished = True
             pending = ui_verification_targets(records, current_profile)
-            st.session_state.active_step = 1 if pending else 2 if any(r["status"] == "PTSL_REVIEW" for r in records) else 3
+            st.session_state.active_step = 1 if pending else 3 if any(r["status"] == "PTSL_REVIEW" for r in records) else 4
             if pending:
                 st.session_state.verification_notice = "Some records could not be verified. Retry them before final release."
             st.rerun()
@@ -2069,19 +2319,45 @@ def main():
             st.warning(st.session_state.pop("verification_notice"))
         if verified:
             if st.button("Continue to PTSL Review" if queue_count else "Continue to Final Release", type="primary"):
-                st.session_state.active_step = 2 if queue_count else 3
+                st.session_state.active_step = 3 if queue_count else 4
                 st.rerun()
+        held_count = sum(r.get("sampling") == "held" for r in records)
+        if held_count:
+            st.info(f"{held_count:,} rules-passed records are held at Silver and not sent to Agent 2. They stay out of Gold until sampled; raise the sample % to include them.")
         flags = quality_summary(batch)
         st.caption(f"Quality flags · Near-Malay {flags['lang_near_malay']} · 3R {flags['three_r']} · Explicit {flags['explicit_content']} · Damaged {flags['damaged_chars']} · Seed hygiene {flags['seed_hygiene']}")
+        with st.expander("Bronze registry (immutable raw-file ledger)", expanded=False):
+            if batch.get("bronze"):
+                st.dataframe(batch["bronze"], hide_index=True, width="stretch")
+            else:
+                st.caption("No Bronze entries yet. Upload files to register their SHA-256, size and UTC ingestion time.")
+            near_meta = batch.get("silver", {}).get("near_duplicate", {})
+            if near_meta.get("enabled"):
+                st.caption(f"MinHash near-duplicates · threshold {near_meta['threshold']} · {near_meta['groups']} groups · {near_meta['records']} flagged records")
+            agent_meta = batch.get("silver", {}).get("agent1", {})
+            if agent_meta.get("enabled"):
+                st.caption(f"Agent 1 ({AGENT1_NAME}) · eligible {agent_meta.get('eligible', 0)} · applied {agent_meta.get('applied', 0)} · rejected {agent_meta.get('rejected', 0)} · errors {agent_meta.get('error', 0)}")
         with st.expander("Quality & provenance", expanded=False):
             for issue in batch["issues"]:
                 st.warning(issue)
             st.caption(f"API errors {counts['ERROR']} · Duplicate-excluded {counts['DUPLICATE']} · Human-approved {counts['HUMAN_APPROVED']}")
             if batch["sources"]:
                 st.dataframe(batch["sources"], hide_index=True, width="stretch")
-                st.dataframe([{"record": r["id"], "stage": r.get("stage"), "status": r["status"], "origin": r.get("origin_type", "human"), "language": r.get("language", "unverified"), "reason": r["reason"]} for r in records], hide_index=True, width="stretch")
+                st.dataframe([{"record": r["id"], "gate": GATE_BADGES[gate_outcome(r)], "stage": r.get("stage"), "status": r["status"], "origin": r.get("origin_type", "human"), "language": r.get("language", "unverified"), "reason": r["reason"]} for r in records], hide_index=True, width="stretch")
             st.caption("Masked batches and review decisions are stored in the shared database. Original uploaded bytes are not stored. Confirm dataset licences and project policy before production use.")
-    if active_step == 2:
+    if active_step == 2 and not reviewer_only:
+        gates = gate_counts(records)
+        gate_help = {"PASS": "AUTO_PASS or human-approved: eligible for Gold.", "WARN": "Minor quality, variant or near-duplicate flags: routed to human review.", "REVIEW": "Substantive edits or errors: PTSL human review required.", "BLOCK": "QUARANTINE or API ERROR: excluded from Gold."}
+        for col, label in zip(st.columns(4), GATE_ORDER):
+            col.metric(label, gates[label], border=True, help=gate_help[label])
+        st.caption(f"Quality Gate by Qwen Agent 2 ({config.model}) · duplicates excluded {gates['DUPLICATE']} · not yet verified {gates['PENDING']} · held at Silver {sum(r.get('sampling') == 'held' for r in records)}")
+        st.dataframe([{"record": r["id"], "gate": GATE_BADGES[gate_outcome(r)], "status": r["status"], "confidence": ((r.get("verification") or {}).get("result") or {}).get("confidence"), "flags": ", ".join(gate_reasons(r)), "reason": r["reason"]} for r in records[:1000]], hide_index=True, width="stretch")
+        if len(records) > 1000:
+            st.caption("Showing the first 1,000 records; the full gate table is in manifest.json.")
+        if st.button("Continue to PTSL Review" if queue_count else "Continue to Final Release", type="primary", key="gate_continue"):
+            st.session_state.active_step = 3 if queue_count else 4
+            st.rerun()
+    if active_step == 3:
         ui_portal_sync(st, store)
         stage_filter = st.segmented_control("Stage filter", ["All"] + [f"Gold {i}" for i in range(1, 5)], default="All", selection_mode="single", required=True)
         selected_stage = None if stage_filter == "All" else "GOLD_" + stage_filter[-1]
@@ -2170,9 +2446,9 @@ def main():
         else:
             st.info("No records waiting in this review filter." if queue_count else "PTSL review is complete.")
             if not queue_count and verified and st.button("Continue to Final Release", type="primary"):
-                st.session_state.active_step = 3
+                st.session_state.active_step = 4
                 st.rerun()
-    if active_step == 3 and not reviewer_only:
+    if active_step == 4 and not reviewer_only:
         from analytics import render as render_analytics
         render_analytics(st, records)
         include_governance = ui_setting(st, settings, "include_governance", "checkbox", "Include governance & audit files", help="Default ZIP: JSONL only. Full immutable snapshots remain available in Release History.")

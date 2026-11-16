@@ -36,8 +36,8 @@ def test_empty_first_wizard_step():
     assert not app.exception
     assert not app.tabs
     assert app.session_state['active_step']==1
-    assert find_button(app, '2. PTSL Human Review').disabled
-    assert find_button(app, '3. Validate & Export').disabled
+    assert find_button(app, '3. PTSL Human Review').disabled
+    assert find_button(app, '4. Gold Release').disabled
     assert find_button(app, 'Run Qwen 3 Verification').disabled
     assert not app.get('download_button')
     assert [m.value for m in app.metric] == ['0', '0.0%', '0', '0', '0', '0', '0', '0']

@@ -302,7 +302,7 @@ def assess(out,args):
 
 def main():
     p=argparse.ArgumentParser(description=__doc__);p.add_argument('command',choices=['generate','pipeline','qwen']);p.add_argument('--output',type=Path,default=ROOT/'output'/'hard-test')
-    p.add_argument('--base-url',default='http://127.0.0.1:8000/v1');p.add_argument('--model',default='Qwen/Qwen3-8B');p.add_argument('--mode',default='structured_outputs',choices=['structured_outputs','guided_json','json_object']);p.add_argument('--timeout',type=int,default=120)
+    p.add_argument('--base-url',default='http://127.0.0.1:8000/v1');p.add_argument('--model',default='qwen3-14b');p.add_argument('--mode',default='structured_outputs',choices=['structured_outputs','guided_json','json_object']);p.add_argument('--timeout',type=int,default=120)
     args=p.parse_args();args.output.mkdir(parents=True,exist_ok=True)
     if args.command=='generate':generate(args.output)
     elif args.command=='pipeline':pipeline(args.output)

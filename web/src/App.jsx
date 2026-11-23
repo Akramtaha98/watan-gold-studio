@@ -78,7 +78,7 @@ export default function App() {
   useEffect(() => {
     if (!st) return;
     const p = prev.current;
-    if (p?.job?.state === "running" && st.job?.state !== "running" && st.job?.kind === "verify") notify(st.job.error || "Quality Gate finished.");
+    if (p?.job?.state === "running" && st.job?.state !== "running" && st.job?.kind === "verify") notify(st.job.error || (st.job.state === "stopped" ? "Quality Gate stopped. Finished records were kept." : "Quality Gate finished."));
     if (!p && st.has_batch) setView(st.step);
     if (p && !p.has_batch && st.has_batch) setView(1);
     if (p?.has_batch && !st.has_batch) setView(1);

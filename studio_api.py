@@ -156,6 +156,7 @@ class Job:
     def __init__(self, kind, total):
         self.kind, self.total, self.done = kind, total, 0
         self.state, self.error = "running", None
+        self.stop = threading.Event()
         self.started, self.finished = time.time(), None
         self.counts, self.recent = Counter(), []
         self.lock = threading.Lock()
@@ -168,14 +169,15 @@ class Job:
 
     def finish(self, error=None):
         with self.lock:
-            self.state, self.error, self.finished = ("error" if error else "done"), error, time.time()
+            state = "error" if error else ("stopped" if self.stop.is_set() else "done")
+            self.state, self.error, self.finished = state, error, time.time()
 
     def view(self):
         with self.lock:
             elapsed = (self.finished or time.time()) - self.started
             rate = self.done / elapsed if elapsed > 0 else 0
             eta = (self.total - self.done) / rate if rate and self.state == "running" else 0
-            return {"kind": self.kind, "state": self.state, "error": self.error, "done": self.done, "total": self.total,
+            return {"kind": self.kind, "state": self.state, "error": self.error, "stopping": self.stop.is_set() and self.state == "running", "done": self.done, "total": self.total,
                     "elapsed": round(elapsed, 1), "rate": round(rate, 2), "eta": round(eta, 1), "counts": dict(self.counts), "recent": list(self.recent)}
 
 
@@ -442,8 +444,9 @@ def start_agent1(batch, batch_id):
 
     def work():
         try:
-            w.run_agent1(batch, config, workers=ws.settings["workers"], on_progress=lambda *a: None)
-            job.done = job.total
+            w.run_agent1(batch, config, workers=ws.settings["workers"], on_progress=lambda done, total: setattr(job, "done", done), stop=job.stop)
+            if not job.stop.is_set():
+                job.done = job.total
             job.counts.update(batch.get("silver", {}).get("agent1", {}))
             ws.db.save_records(batch_id, batch["records"])
             ws.db.save_batch_meta(batch_id, batch)
@@ -552,7 +555,7 @@ def verify():
 
     def work():
         try:
-            w.verify_records(targets, config, policy, workers=s["workers"], on_progress=progress)
+            w.verify_records(targets, config, policy, workers=s["workers"], on_progress=progress, stop=job.stop)
             flush(force=True)
             job.finish()
         except Exception as exc:
@@ -564,6 +567,16 @@ def verify():
 
     threading.Thread(target=work, daemon=True).start()
     return job.view()
+
+
+@app.post("/api/stop")
+def stop():
+    """Ask the running step (Agent 1 or Quality Gate) to stop. Work already finished is kept."""
+    current = ws.job
+    if not current or current.state != "running":
+        raise HTTPException(409, "Nothing is running.")
+    current.stop.set()
+    return current.view()
 
 
 @app.get("/api/job")

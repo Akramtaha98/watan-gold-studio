@@ -9,6 +9,7 @@ const paths = {
   arrow: "M5 12h14m0 0l-5-5m5 5l-5 5",
   play: "M8 5.5v13l11-6.5z",
   stop: "M7 7h10v10H7z",
+  grid: "M4 4h6v6H4zM14 4h6v6h-6zM4 14h6v6H4zM14 14h6v6h-6z",
   logo: "M9 10l3 12 4-9 4 9 3-12",
   download: "M12 4v12m0 0l-4-4m4 4l4-4M5 20h14",
   reset: "M4 12a8 8 0 108-8M4 4v5h5",

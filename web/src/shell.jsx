@@ -1,5 +1,6 @@
 import React from "react";
 import { GateStep, ReleaseStep, ReviewStep, UploadStep } from "./steps.jsx";
+import { PipelineView } from "./pipeline.jsx";
 import { Icon } from "./ui.jsx";
 
 /** Stepper + the active step. Steps unlock as the pipeline advances. */
@@ -14,13 +15,14 @@ export function Pipeline({ st, view, setView, refresh, notify }) {
       pct: st.verified && st.review === 0 ? 100 : 0 },
     { n: 4, title: "Gold Release", sub: released ? "Ready to download" : `${st.gold_ready || 0} ready`, done: released, open: has && st.gold_ready > 0, pct: released ? 100 : 0 },
   ];
+  steps.push({ n: 5, title: "Pipeline", sub: has ? `${st.records} records · all files` : "Per file & folder", done: false, open: has, pct: 0, overview: true });
   const props = { st, refresh, notify, go: setView };
   return (
     <>
-      <nav className="stepper" aria-label="Pipeline steps">
+      <nav className="stepper five" aria-label="Pipeline steps">
         {steps.map((s) => (
           <button key={s.n} className={`step ${view === s.n ? "active" : ""} ${s.done ? "done" : ""}`} disabled={!s.open} onClick={() => setView(s.n)} aria-current={view === s.n ? "step" : undefined}>
-            <span className="badge">{s.done ? <Icon name="check" size={16} stroke={3} /> : s.n}</span>
+            <span className="badge">{s.done ? <Icon name="check" size={16} stroke={3} /> : s.overview ? <Icon name="grid" size={16} /> : s.n}</span>
             <span>
               <b>{s.title}</b>
               <small>{s.sub}</small>
@@ -33,6 +35,7 @@ export function Pipeline({ st, view, setView, refresh, notify }) {
       {view === 2 && has && <GateStep {...props} />}
       {view === 3 && has && <ReviewStep {...props} />}
       {view === 4 && has && <ReleaseStep {...props} />}
+      {view === 5 && has && <PipelineView st={st} />}
     </>
   );
 }

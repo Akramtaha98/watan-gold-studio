@@ -254,6 +254,35 @@ def txt_rows(text):
         continue
 
 
+CHUNK_CHARS = int(os.environ.get("STUDIO_CHUNK_CHARS", "1200"))
+
+
+def chunk_plain_text(text, limit=None):
+    """Split plain text into chunks of at most `limit` characters, breaking on line ends."""
+    limit = limit or CHUNK_CHARS
+    chunk, size = [], 0
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        while len(line) > limit:
+            cut = line.rfind(" ", 0, limit)
+            if cut <= 0:
+                cut = limit
+            if chunk:
+                yield " ".join(chunk)
+                chunk, size = [], 0
+            yield line[:cut].strip()
+            line = line[cut:].strip()
+        if size + len(line) + 1 > limit and chunk:
+            yield " ".join(chunk)
+            chunk, size = [], 0
+        chunk.append(line)
+        size += len(line) + 1
+    if chunk:
+        yield " ".join(chunk)
+
+
 def read_rows(name, data):
     suffix = Path(name).suffix.lower()
     if suffix == ".jsonl":
@@ -269,11 +298,22 @@ def read_rows(name, data):
         if text.lstrip().startswith("{"):
             yield from read_rows("input.jsonl", data)
         else:
-            for n, block in enumerate(re.split(r"\n\s*\n", text.strip()), 1):
+            n = 0
+            for block in re.split(r"\n\s*\n", text.strip()):
                 try:
-                    yield n, next(txt_rows(block)), None
+                    row = next(txt_rows(block))
                 except ValueError as exc:
+                    n += 1
                     yield n, None, str(exc)
+                    continue
+                body = row.get("text") if isinstance(row, dict) else None
+                if isinstance(body, str) and len(body) > CHUNK_CHARS:
+                    for piece in chunk_plain_text(body):
+                        n += 1
+                        yield n, {**row, "text": piece}, None
+                else:
+                    n += 1
+                    yield n, row, None
     elif suffix == ".docx":
         from docx import Document
         from docx.text.paragraph import Paragraph

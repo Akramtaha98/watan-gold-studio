@@ -30,8 +30,8 @@ from jsonschema import Draft202012Validator
 
 import silver
 
-MAX_FILE_BYTES = 25 * 1024 * 1024
-MAX_RECORDS = 20_000
+MAX_FILE_BYTES = int(os.environ.get("STUDIO_MAX_FILE_MB", "25")) * 1024 * 1024
+MAX_RECORDS = int(os.environ.get("STUDIO_MAX_RECORDS", "20000"))
 MAX_RECORD_CHARS = 48_000
 PASS_THRESHOLD = 0.95
 REVIEW_THRESHOLD = 0.75
@@ -374,6 +374,12 @@ def read_rows(name, data):
         raise ValueError("Supported files: JSONL, XLSX, CSV, Parquet, TXT, DOCX and PDF.")
 
 
+def source_folder(name):
+    """Folder part of an uploaded path ("a/b/file.txt" -> "a/b"); never contains "..", drive letters or a leading slash."""
+    parts = [p for p in str(name).replace("\\", "/").split("/")[:-1] if p and p not in {".", ".."} and not p.endswith(":")]
+    return mask_pii("/".join(parts))[0][:200]
+
+
 def ingest_files(files, prompt_column="", answer_column="", default_origin="human", silver_rules=None, near_dup_threshold=None):
     """files = [(name, bytes), ...]. Persist only masked rows and hash provenance.
 
@@ -386,13 +392,14 @@ def ingest_files(files, prompt_column="", answer_column="", default_origin="huma
     for file_index, (name, data) in enumerate(files, 1):
         fingerprint = sha256(data)
         safe_name = mask_pii(Path(name).name)[0]
+        folder = source_folder(name)
         if fingerprint in seen_files:
             file_aliases.append({"name": safe_name, "sha256": fingerprint, "representative_source_id": next(src["source_id"] for src in sources if src["sha256"] == fingerprint)})
             issues.append(f"{safe_name}: identical file skipped (SHA-256 match).")
             continue
         seen_files.add(fingerprint)
         bronze.append(silver.bronze_entry(safe_name, data, ingested_at))
-        source = {"source_id": f"F{file_index:03d}", "name": safe_name, "sha256": fingerprint, "bytes": len(data), "rows": 0}
+        source = {"source_id": f"F{file_index:03d}", "name": safe_name, "folder": folder, "sha256": fingerprint, "bytes": len(data), "rows": 0}
         sources.append(source)
         if len(data) > MAX_FILE_BYTES:
             issues.append(f"{safe_name}: file exceeds 25 MiB; no rows ingested.")
@@ -1814,7 +1821,7 @@ def build_exports(batch, config, policy, fraction=.12, tokenizer=None, overlap=6
     manifest={"manifest_version":5,"pipeline":pipeline_summary(batch),"silver_run_id":run_id,"silver_run_ids":sorted(set(declared_runs) | {r["silver_run_id"] for r in tables["GOLD_1"]+synthetic_tables["GOLD_1"]}) or [run_id],"gold_version":gold_version,
         "release_id":"wr-"+sha256(canonical_json([current,gold_version,fraction,holdout_enabled,include_conversations,overlap,embedding_model,file_info]))[:20],"generated_at":now(),
         "source_code_sha256":sha256(Path(__file__).read_bytes()),"code_commit":None,"files":file_info,"row_counts":{name:v['rows'] for name,v in file_info.items()},
-        "sources":[{k:v for k,v in source.items() if k!='name'} for source in batch['sources']],"source_status_counts":dict(Counter(r['status'] for r in batch['records'])),
+        "sources":[{k:v for k,v in source.items() if k not in ('name','folder')} for source in batch['sources']],"source_status_counts":dict(Counter(r['status'] for r in batch['records'])),
         "stage_source_counts":{key:len(gold[key]) for key in STAGES},"sft_origin_counts":{"human":len(human),"synthetic":len(synth)},"quality_summary":quality_summary(batch),
         "duplicate_links":duplicate_provenance(batch),"duplicate_groups":duplicate_provenance(batch),"duplicate_mappings":[{"record_id":r["id"],"duplicate_group_id":r.get("duplicate_group_id"),"representative_id":r.get("duplicate_of_id"),"status":r["status"]} for r in batch["records"] if r.get("duplicate_group_id")],"category_coverage":{"sft":dict(Counter(r['category'] for r in sft)),"eval":dict(Counter(r['category'] for r in gold['GOLD_4']))},
         "holdout":{"enabled":holdout_enabled,"mode":"intent_and_answer_stem_groups" if holdout_enabled else "dedicated_inputs","requested_fraction":fraction,"actual_fraction":plan['holdout_ratio'],"missing_categories":plan['missing_eval_categories'],"components":plan['intent_components']},

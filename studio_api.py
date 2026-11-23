@@ -39,7 +39,7 @@ log = logging.getLogger("studio_api")
 ROOT = Path(__file__).parent
 DIST = ROOT / "web" / "dist"
 EXAMPLES = ROOT / "examples"
-MAX_UPLOAD = 50 * 1024 * 1024
+MAX_UPLOAD = int(os.getenv("STUDIO_MAX_UPLOAD_MB", "50")) * 1024 * 1024
 PREVIEW = 220
 ALLOWED_USES = ("train", "rag_display", "eval")
 # Which allowed uses each Gold stage needs before its rows may enter a trainer/index/eval JSONL file.
@@ -476,6 +476,12 @@ def ingest(files):
     return overview()
 
 
+def upload_path(filename):
+    """Keep the relative folder of a dropped folder ("a/b/c.txt") but never anything that could escape it."""
+    parts = [p for p in str(filename or "upload").replace("\\", "/").split("/") if p and p not in {".", ".."} and not p.endswith(":")]
+    return "/".join(parts) or "upload"
+
+
 @app.post("/api/upload")
 async def upload(files: list[UploadFile] = File(...)):
     need_idle()
@@ -484,8 +490,8 @@ async def upload(files: list[UploadFile] = File(...)):
         blob = await f.read()
         total += len(blob)
         if total > MAX_UPLOAD:
-            raise HTTPException(413, "Upload exceeds 50 MB.")
-        data.append((Path(f.filename or "upload").name, blob))
+            raise HTTPException(413, f"Upload exceeds {MAX_UPLOAD // (1024 * 1024)} MB.")
+        data.append((upload_path(f.filename), blob))
     with ws.lock:
         return ingest(data)
 
@@ -577,6 +583,117 @@ def stop():
         raise HTTPException(409, "Nothing is running.")
     current.stop.set()
     return current.view()
+
+
+def _blank_group(key, label):
+    return {"key": key, "label": label, "files": 0, "bytes": 0, "records": 0, "excluded": 0, "messy": 0,
+            "agent1": {"applied": 0, "rejected": 0, "error": 0, "waiting": 0},
+            "gate": {"checked": 0, "waiting": 0, "held": 0, "PASS": 0, "WARN": 0, "REVIEW": 0, "BLOCK": 0},
+            "ptsl": {"needed": 0, "done": 0, "waiting": 0}, "gold": 0}
+
+
+def _add_record(g, r):
+    status = r["status"]
+    silver_info = r.get("silver", {})
+    if status == "DUPLICATE":
+        g["excluded"] += 1
+        return
+    g["records"] += 1
+    if silver_info.get("messy"):
+        g["messy"] += 1
+    a1 = silver_info.get("agent1", {}).get("status")
+    if a1 in g["agent1"]:
+        g["agent1"][a1] += 1
+    elif silver_info.get("messy") and w.agent1_eligible(r):
+        g["agent1"]["waiting"] += 1
+    if status == "PENDING":
+        g["gate"]["held" if r.get("sampling") == "held" else "waiting"] += 1
+    else:
+        g["gate"]["checked"] += 1
+        outcome = w.gate_outcome(r)
+        if outcome in g["gate"]:
+            g["gate"][outcome] += 1
+    human = status == "PTSL_REVIEW" or status == "HUMAN_APPROVED" or any(h.get("reviewer_role") for h in r.get("history", []))
+    if human:
+        g["ptsl"]["needed"] += 1
+        g["ptsl"]["waiting" if status == "PTSL_REVIEW" else "done"] += 1
+    if status in w.GOLD_STATES:
+        g["gold"] += 1
+
+
+def _finish_group(g):
+    """Share of this group's records that need no further work, plus what is left per stage."""
+    waiting_gate = g["gate"]["waiting"]
+    waiting_ptsl = g["ptsl"]["waiting"]
+    total = g["records"]
+    remaining = waiting_gate + waiting_ptsl
+    g["remaining"] = {"quality_gate": waiting_gate, "ptsl": waiting_ptsl, "total": remaining}
+    g["percent"] = round(100 * (total - remaining) / total) if total else 100
+    if not total:
+        g["state"] = "empty"
+    elif remaining == 0:
+        g["state"] = "done"
+    elif waiting_ptsl and not waiting_gate:
+        g["state"] = "review"
+    elif g["gate"]["checked"] or g["gold"]:
+        g["state"] = "running"
+    else:
+        g["state"] = "waiting"
+    return g
+
+
+@app.get("/api/pipeline")
+def pipeline(by: str = "folder", folder: str | None = None, q: str = "", state: str = "", sort: str = "remaining", offset: int = 0, limit: int = 100):
+    """Airflow-style overview: per folder (or per file) progress through Bronze, Silver, Quality Gate, PTSL review and Gold."""
+    batch = need_batch()
+    by = by if by in {"folder", "file"} else "folder"
+    sources = {s["source_id"]: s for s in batch.get("sources", [])}
+    per_file = {}
+    for sid, src in sources.items():
+        g = _blank_group(sid, src.get("name", sid))
+        g.update(files=1, bytes=src.get("bytes", 0), folder=src.get("folder", ""))
+        per_file[sid] = g
+    for r in batch["records"]:
+        g = per_file.get(r.get("source_id"))
+        if g is not None:
+            _add_record(g, r)
+    for g in per_file.values():
+        _finish_group(g)
+
+    def merge(parts, key, label):
+        out = _blank_group(key, label)
+        for g in parts:
+            out["files"] += g["files"]
+            for k in ("bytes", "records", "excluded", "messy", "gold"):
+                out[k] += g[k]
+            for sect in ("agent1", "gate", "ptsl"):
+                for k, v in g[sect].items():
+                    out[sect][k] += v
+        return _finish_group(out)
+
+    files = list(per_file.values())
+    if by == "file":
+        rows = [g for g in files if folder is None or g["folder"] == folder]
+    else:
+        buckets = {}
+        for g in files:
+            buckets.setdefault(g["folder"], []).append(g)
+        rows = [merge(parts, key, key or "(top level)") for key, parts in buckets.items()]
+    total = merge(files, "all", "All files")
+    states = Counter(g["state"] for g in rows)
+    needle = q.strip().lower()
+    if needle:
+        rows = [g for g in rows if needle in g["label"].lower() or needle in g.get("folder", "").lower()]
+    if state:
+        rows = [g for g in rows if g["state"] == state]
+    sorters = {"remaining": lambda g: (-g["remaining"]["total"], g["label"]), "name": lambda g: g["label"].lower(), "percent": lambda g: (g["percent"], g["label"]),
+               "records": lambda g: (-g["records"], g["label"])}
+    rows.sort(key=sorters.get(sort, sorters["remaining"]))
+    job_view = ws.job.view() if ws.job else None
+    eta = job_view["eta"] if job_view and job_view["state"] == "running" else None
+    limit = max(1, min(limit, 500))
+    return {"by": by, "total": total, "groups": rows[offset:offset + limit], "count": len(rows), "folders": len({g["folder"] for g in files}), "files": len(files),
+            "job": job_view, "eta": eta, "states": dict(states)}
 
 
 @app.get("/api/job")

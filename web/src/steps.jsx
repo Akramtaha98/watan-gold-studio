@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
-import { api } from "./api.js";
+import { api, filesFromDrop } from "./api.js";
 import { GATES, GateBadge, Icon, Processing, Toggle, asText } from "./ui.jsx";
 
 const short = (h) => (h ? `${h.slice(0, 10)}…${h.slice(-6)}` : "");
@@ -12,6 +12,7 @@ export function UploadStep({ st, refresh, notify, go }) {
   const [over, setOver] = useState(false);
   const [busy, setBusy] = useState(false);
   const input = useRef();
+  const folderInput = useRef();
   const s = st.settings;
   const job = st.job?.kind === "agent1" ? st.job : null;
 
@@ -44,16 +45,18 @@ export function UploadStep({ st, refresh, notify, go }) {
           className={`drop ${over ? "over" : ""}`}
           onDragOver={(e) => { e.preventDefault(); setOver(true); }}
           onDragLeave={() => setOver(false)}
-          onDrop={(e) => { e.preventDefault(); setOver(false); send(() => api.upload(e.dataTransfer.files)); }}
+          onDrop={(e) => { e.preventDefault(); setOver(false); send(async () => api.upload(await filesFromDrop(e.dataTransfer))); }}
         >
           <div className="icon"><Icon name="upload" size={26} /></div>
           <h3>{busy ? "Reading files…" : "Drag files here"}</h3>
           <p>or choose them from your computer</p>
           <div className="row" style={{ justifyContent: "center" }}>
             <button className="btn primary" disabled={busy} onClick={() => input.current.click()}>Choose files</button>
+            <button className="btn" disabled={busy} onClick={() => folderInput.current.click()}>Choose folder</button>
             <button className="btn" disabled={busy} onClick={() => send(api.sample)}>Try sample data</button>
           </div>
           <input ref={input} type="file" multiple hidden onChange={(e) => e.target.files.length && send(() => api.upload(e.target.files))} />
+          <input ref={folderInput} type="file" multiple hidden webkitdirectory="" directory="" onChange={(e) => e.target.files.length && send(() => api.upload(e.target.files))} />
         </div>
 
         <div className="options mt">

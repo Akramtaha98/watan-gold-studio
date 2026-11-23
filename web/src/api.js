@@ -29,10 +29,12 @@ export const api = {
   health: () => call("/api/health"),
   state: () => call("/api/state"),
   job: () => call("/api/job"),
+  pipeline: (params) => call("/api/pipeline?" + new URLSearchParams(params)),
   settings: (patch) => call("/api/settings", { method: "POST", body: patch }),
   upload: (files) => {
     const form = new FormData();
-    [...files].forEach((f) => form.append("files", f));
+    // items are Files (folder picker sets webkitRelativePath) or {file, path} from a dropped folder
+    [...files].forEach((f) => (f.file ? form.append("files", f.file, f.path) : form.append("files", f, f.webkitRelativePath || f.name)));
     return call("/api/upload", { method: "POST", body: form });
   },
   sample: () => call("/api/sample", { method: "POST" }),
@@ -48,3 +50,26 @@ export const api = {
   downloadUrl: () => "/api/release/download" + (getToken() ? `?token=${encodeURIComponent(getToken())}` : ""),
   manifestUrl: () => "/api/release/manifest" + (getToken() ? `?token=${encodeURIComponent(getToken())}` : ""),
 };
+
+/** Files from a drop, walking dropped folders so each file keeps its relative path. */
+export async function filesFromDrop(dataTransfer) {
+  const items = [...(dataTransfer.items || [])].map((i) => (i.webkitGetAsEntry ? i.webkitGetAsEntry() : null)).filter(Boolean);
+  if (!items.length) return [...dataTransfer.files];
+  const out = [];
+  const readAll = (reader) =>
+    new Promise((resolve, reject) => {
+      const all = [];
+      const next = () => reader.readEntries((batch) => (batch.length ? (all.push(...batch), next()) : resolve(all)), reject);
+      next();
+    });
+  const walk = async (entry, prefix) => {
+    if (entry.isFile) {
+      const file = await new Promise((res, rej) => entry.file(res, rej));
+      out.push({ file, path: prefix + entry.name });
+    } else if (entry.isDirectory) {
+      for (const child of await readAll(entry.createReader())) await walk(child, prefix + entry.name + "/");
+    }
+  };
+  for (const entry of items) await walk(entry, "");
+  return out;
+}

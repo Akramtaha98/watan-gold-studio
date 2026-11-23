@@ -273,3 +273,21 @@ tr.click { cursor: pointer; } tr.click:hover td { background: #fffaea; }
   .stage:not(:last-child)::after { display: none; }
   .stepper.five { grid-template-columns: repeat(2, 1fr); }
 }
+
+/* ---- parallel folder groups ---- */
+.runbar { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; margin-top: 16px; padding: 12px 14px; background: #fbf8ef; border: 1px solid var(--line); border-radius: 12px; }
+.runbar label { display: inline-flex; align-items: center; gap: 8px; color: var(--muted); font-size: 13px; }
+.runbar .input { padding: 5px 8px; }
+.btn.sm { padding: 5px 10px; font-size: 12.5px; border-radius: 9px; gap: 5px; }
+.btn.danger:hover:not(:disabled) { filter: brightness(1.08); }
+.ptable td.acts { min-width: 150px; }
+.num .live { color: #1d4ed8; font-size: 11.5px; font-weight: 600; white-space: nowrap; }
+.chip.queued { background: #e9e4f7; color: #5b3fb0; }
+button.link { border: 0; background: none; padding: 0; color: var(--gold-deep); text-decoration: underline; cursor: pointer; font: inherit; }
+
+.ptable td { min-width: 0; padding: 9px 8px; }
+.ptable th { padding: 9px 8px; font-size: 11px; }
+.ptable td.name { min-width: 130px; max-width: 220px; }
+.ptable td.acts { min-width: 0; white-space: nowrap; }
+.num .live { display: block; margin-top: 1px; }
+.ptable td:nth-child(n+3) { min-width: 78px; }

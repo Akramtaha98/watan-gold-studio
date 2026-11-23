@@ -250,7 +250,7 @@ export function GateStep({ st, refresh, notify, go }) {
 }
 
 /* ------------------------------------------------------------------ 3 */
-export function ReviewStep({ st, refresh, notify, go }) {
+export function ReviewStep({ st, refresh, notify, go, group = null, clearGroup }) {
   const [queue, setQueue] = useState(null);
   const [seen, setSeen] = useState([]);
   const [item, setItem] = useState(null);
@@ -258,9 +258,9 @@ export function ReviewStep({ st, refresh, notify, go }) {
   const s = st.settings;
 
   const load = useCallback(async () => {
-    const d = await api.records({ status: "PTSL_REVIEW", limit: 200 });
+    const d = await api.records(group === null ? { status: "PTSL_REVIEW", limit: 200 } : { status: "PTSL_REVIEW", limit: 200, group });
     setQueue(d.items);
-  }, []);
+  }, [group]);
   useEffect(() => { load().catch(() => {}); }, [load, st.review]);
   const next = queue?.find((r) => !seen.includes(r.id));
   useEffect(() => { next ? api.record(next.id).then(setItem).catch(() => setItem(null)) : setItem(null); }, [next?.id]);
@@ -301,12 +301,25 @@ export function ReviewStep({ st, refresh, notify, go }) {
     );
   }
   const remaining = (queue || []).filter((r) => !seen.includes(r.id)).length;
+  if (group !== null && queue && queue.length === 0) {
+    return (
+      <div className="card done-hero">
+        <div className="check"><Icon name="check" size={34} stroke={3} /></div>
+        <h2>Nothing left to review in {group || "(top level)"}</h2>
+        <p className="sub">Every flagged record in this folder has a human decision.</p>
+        <div className="row" style={{ justifyContent: "center" }}>
+          <button className="btn primary big" onClick={() => go(5)}>Back to pipeline <Icon name="arrow" /></button>
+          <button className="btn big" onClick={clearGroup}>Review all folders</button>
+        </div>
+      </div>
+    );
+  }
   return (
     <div className="card">
       <div className="rev-head">
         <div>
-          <h2 style={{ margin: 0 }}>Human review</h2>
-          <p className="sub" style={{ margin: 0 }}>{st.review} waiting · {remaining} in your queue</p>
+          <h2 style={{ margin: 0 }}>Human review{group !== null && <span className="chip review" style={{ marginLeft: 10, verticalAlign: "middle" }}>Folder: {group || "(top level)"}</span>}</h2>
+          <p className="sub" style={{ margin: 0 }}>{group !== null ? `${queue ? queue.length : "…"} waiting in this folder` : `${st.review} waiting`} · {remaining} in your queue{group !== null && <> · <button className="link" onClick={() => go(5)}>back to pipeline</button> · <button className="link" onClick={clearGroup}>all folders</button></>}</p>
         </div>
         <div className="row">
           <label className="field" style={{ gridAutoFlow: "column", alignItems: "center", gap: 8 }}>

@@ -18,6 +18,7 @@ import copy
 import json
 import logging
 import os
+import queue
 import secrets
 import threading
 import time
@@ -85,6 +86,7 @@ class Workspace:
         self.batch, self.batch_id = None, None
         self.settings = default_settings()
         self.job = None
+        self.groups = {}  # folder -> Job; each folder is an isolated group that can run in parallel with the others
         self.release = None
         self.seen_seq = 0
         self.policy = w.strict_json(w.POLICY_PATH.read_text(encoding="utf-8"))
@@ -124,7 +126,7 @@ class Workspace:
         """Pull changes written through the database (PTSL portal, other processes) into memory."""
         with self.lock:
             active = self.db.active_batch_id()
-            busy = bool(self.job and self.job.state == "running")
+            busy = running()
             if active != self.batch_id:
                 if not busy:
                     self.batch_id = active
@@ -153,9 +155,9 @@ ws = Workspace()
 class Job:
     """Progress of one background step, polled by the UI."""
 
-    def __init__(self, kind, total):
-        self.kind, self.total, self.done = kind, total, 0
-        self.state, self.error = "running", None
+    def __init__(self, kind, total, state="running", group=None):
+        self.kind, self.total, self.done, self.group = kind, total, 0, group
+        self.state, self.error = state, None
         self.stop = threading.Event()
         self.started, self.finished = time.time(), None
         self.counts, self.recent = Counter(), []
@@ -167,6 +169,17 @@ class Job:
             self.counts[label] += 1
             self.recent = ([{"n": self.done, "label": label, **(detail or {})}] + self.recent)[:8]
 
+    def begin(self):
+        """Queued -> running. False if it was stopped while it waited."""
+        with self.lock:
+            if self.state != "queued":
+                return False
+            self.state, self.started = "running", time.time()
+            return True
+
+    def active(self):
+        return self.state in {"running", "queued"}
+
     def finish(self, error=None):
         with self.lock:
             state = "error" if error else ("stopped" if self.stop.is_set() else "done")
@@ -177,12 +190,49 @@ class Job:
             elapsed = (self.finished or time.time()) - self.started
             rate = self.done / elapsed if elapsed > 0 else 0
             eta = (self.total - self.done) / rate if rate and self.state == "running" else 0
-            return {"kind": self.kind, "state": self.state, "error": self.error, "stopping": self.stop.is_set() and self.state == "running", "done": self.done, "total": self.total,
+            return {"kind": self.kind, "state": self.state, "error": self.error, "stopping": self.stop.is_set() and self.state == "running", "group": self.group, "done": self.done, "total": self.total,
                     "elapsed": round(elapsed, 1), "rate": round(rate, 2), "eta": round(eta, 1), "counts": dict(self.counts), "recent": list(self.recent)}
 
 
 def running():
-    return bool(ws.job and ws.job.state == "running")
+    """True while any step is active: the whole-batch job or any folder group (running or queued)."""
+    return bool((ws.job and ws.job.state == "running") or any(j.active() for j in ws.groups.values()))
+
+
+def group_map(batch):
+    return {src["source_id"]: src.get("folder", "") for src in batch.get("sources", [])}
+
+
+def group_busy(key):
+    """Is this folder being processed (by itself or by a whole-batch run)?"""
+    job = ws.groups.get(key)
+    return bool((ws.job and ws.job.state == "running") or (job and job.active()))
+
+
+def current_job_view():
+    """What the UI shows as 'the' job: the whole-batch job, or one combined view of all folder groups."""
+    if ws.job:
+        return ws.job.view()
+    if not ws.groups:
+        return None
+    jobs = list(ws.groups.values())
+    views = [j.view() for j in jobs]
+    active = [v for v in views if v["state"] in {"running", "queued"}]
+    counts = Counter()
+    for v in views:
+        counts.update(v["counts"])
+    recent = sorted((r for v in views for r in v["recent"]), key=lambda r: -r["n"])[:8]
+    started = min(j.started for j in jobs)
+    finished = None if active else max((j.finished or j.started) for j in jobs)
+    done, total = sum(v["done"] for v in views), sum(v["total"] for v in views)
+    elapsed = (finished or time.time()) - started
+    rate = sum(v["rate"] for v in views if v["state"] == "running")
+    eta = (total - done) / rate if rate and active else 0
+    state = "running" if active else ("error" if any(v["state"] == "error" for v in views) else ("stopped" if any(v["state"] == "stopped" for v in views) else "done"))
+    error = next((v["error"] for v in views if v["error"]), None)
+    return {"kind": "verify", "state": state, "error": error, "stopping": any(v["stopping"] for v in views), "group": None, "done": done, "total": total, "elapsed": round(elapsed, 1),
+            "rate": round(rate, 2), "eta": round(eta, 1), "counts": dict(counts), "recent": recent,
+            "groups": {"running": sum(v["state"] == "running" for v in views), "queued": sum(v["state"] == "queued" for v in views), "finished": sum(v["state"] in {"done", "stopped", "error"} for v in views)}}
 
 
 # ------------------------------------------------------------------ helpers
@@ -258,7 +308,7 @@ def overview():
     ws.sync()
     b = ws.batch
     if not b:
-        return {"has_batch": False, "step": 1, "settings": public_settings(), "job": ws.job.view() if ws.job else None}
+        return {"has_batch": False, "step": 1, "settings": public_settings(), "job": current_job_view()}
     rows = b["records"]
     gates = w.gate_counts(rows)
     pending = sum(1 for r in rows if r["status"] == "PENDING" and r.get("sampling") != "held")
@@ -268,12 +318,13 @@ def overview():
     step = 1 if not verified and pending else (3 if review else (4 if gold else 2))
     silver_meta = b.get("silver", {})
     decisions = ws.db.decision_summary(ws.batch_id)
-    return {"has_batch": True, "step": step, "verified": verified, "records": len(rows), "gates": gates, "pending": pending, "review": review, "gold_ready": gold,
+    folders = {src.get("folder", "") for src in b.get("sources", [])}
+    return {"has_batch": True, "step": step, "verified": verified, "records": len(rows), "folders": len(folders), "files": len(b.get("sources", [])), "gates": gates, "pending": pending, "review": review, "gold_ready": gold,
             "bronze": [{"name": f.get("filename", f.get("name")), "sha256": f.get("sha256"), "bytes": f.get("bytes", f.get("size")), "at": f.get("ingested_at", f.get("at"))} for f in b.get("bronze", [])],
             "silver": {"cleaning": silver_meta.get("cleaning_enabled", False), "near_duplicate": silver_meta.get("near_duplicate", {}),
                        "agent1": silver_meta.get("agent1", {}), "messy": sum(1 for r in rows if r.get("silver", {}).get("messy")),
                        "duplicates": sum(1 for r in rows if r["status"] == "DUPLICATE"), "held": sum(1 for r in rows if r.get("sampling") == "held")},
-            "issues": [str(i)[:200] for i in b.get("issues", [])][:10], "settings": public_settings(), "job": ws.job.view() if ws.job else None,
+            "issues": [str(i)[:200] for i in b.get("issues", [])][:10], "settings": public_settings(), "job": current_job_view(),
             "release": release_view(), "preview": release_preview(rows),
             "ptsl": {"decisions": decisions["total"], "portal": decisions["by_channel"].get("ptsl_portal", 0), "dashboard": decisions["by_channel"].get("dashboard", 0),
                      "by_verdict": decisions["by_verdict"], "last_at": decisions["last_at"]},
@@ -470,7 +521,7 @@ def ingest(files):
         apply_rights_defaults(batch["records"], s["default_allowed_uses"])
     batch_id = uuid.uuid4().hex
     ws.db.save_batch(batch_id, batch)  # persisted before anything else can fail
-    ws.batch, ws.batch_id, ws.release, ws.job, ws.seen_seq = batch, batch_id, None, None, ws.db.max_seq()
+    ws.batch, ws.batch_id, ws.release, ws.job, ws.groups, ws.seen_seq = batch, batch_id, None, None, {}, ws.db.max_seq()
     if s["agent1_enabled"] and any(w.agent1_eligible(r) for r in batch["records"]):
         start_agent1(batch, batch_id)
     return overview()
@@ -521,22 +572,8 @@ def apply_rights():
     return overview()
 
 
-@app.post("/api/verify")
-def verify():
-    """Step 2: Silver-to-PTSL sampling, then Qwen Agent 2 over the selected records."""
-    need_idle()
-    batch = need_batch()
-    with ws.lock:
-        s, config, batch_id = ws.settings, ws.config(), ws.batch_id
-        w.apply_sampling(batch["records"], s["sampling_enabled"], s["sample_pct"])
-        targets = w.ui_verification_targets(batch["records"], ws.profile())
-        if not targets:
-            raise HTTPException(409, "Nothing to verify. All eligible records are already verified.")
-        ws.db.save_records(batch_id, batch["records"])  # sampling decisions
-        job = Job("verify", len(targets))
-        ws.job, ws.release = job, None
-        policy = copy.deepcopy(ws.policy)
-
+def run_verify(job, targets, batch_id, config, policy, workers):
+    """Run Qwen Agent 2 over `targets`, saving results to SQLite as they arrive. Blocks until done or stopped."""
     pending, plock = [], threading.Lock()
 
     def flush(force=False):
@@ -559,30 +596,114 @@ def verify():
         except Exception:
             log.exception("could not persist Agent 2 results")
 
-    def work():
+    try:
+        w.verify_records(targets, config, policy, workers=workers, on_progress=progress, stop=job.stop)
+        flush(force=True)
+        job.finish()
+    except Exception as exc:
         try:
-            w.verify_records(targets, config, policy, workers=s["workers"], on_progress=progress, stop=job.stop)
             flush(force=True)
-            job.finish()
-        except Exception as exc:
-            try:
-                flush(force=True)
-            except Exception:
-                log.exception("could not persist Agent 2 results")
-            job.finish(str(exc)[:200] or "Verification failed.")
+        except Exception:
+            log.exception("could not persist Agent 2 results")
+        job.finish(str(exc)[:200] or "Verification failed.")
 
-    threading.Thread(target=work, daemon=True).start()
+
+@app.post("/api/verify")
+def verify():
+    """Step 2: Silver-to-PTSL sampling, then Qwen Agent 2 over the selected records."""
+    need_idle()
+    batch = need_batch()
+    with ws.lock:
+        s, config, batch_id = ws.settings, ws.config(), ws.batch_id
+        w.apply_sampling(batch["records"], s["sampling_enabled"], s["sample_pct"])
+        targets = w.ui_verification_targets(batch["records"], ws.profile())
+        if not targets:
+            raise HTTPException(409, "Nothing to verify. All eligible records are already verified.")
+        ws.db.save_records(batch_id, batch["records"])  # sampling decisions
+        job = Job("verify", len(targets))
+        ws.job, ws.groups, ws.release = job, {}, None
+        policy = copy.deepcopy(ws.policy)
+    threading.Thread(target=run_verify, args=(job, targets, batch_id, config, policy, s["workers"]), daemon=True).start()
     return job.view()
 
 
+@app.post("/api/groups/verify")
+def verify_groups(body: dict = Body(default={})):
+    """Run the Quality Gate for folder groups in parallel. Each group is isolated: its own progress, its own Stop."""
+    batch = need_batch()
+    if ws.job and ws.job.state == "running":
+        raise HTTPException(423, "A whole-batch step is still running.")
+    gmap = group_map(batch)
+    known = sorted(set(gmap.values()))
+    keys = body.get("groups")
+    keys = known if keys is None else [str(k) for k in keys]
+    unknown = [k for k in keys if k not in known]
+    if unknown:
+        raise HTTPException(422, f"Unknown folder group: {unknown[0]!r}")
+    try:
+        parallel = max(1, min(int(body.get("parallel") or 3), 16))
+    except (TypeError, ValueError):
+        raise HTTPException(422, "parallel must be a number.") from None
+    by_group = {}
+    for r in batch["records"]:
+        by_group.setdefault(gmap.get(r.get("source_id"), ""), []).append(r)
+    queue_jobs, skipped = [], []
+    with ws.lock:
+        s, config, batch_id, policy = ws.settings, ws.config(), ws.batch_id, copy.deepcopy(ws.policy)
+        profile = ws.profile()
+        ws.job = None
+        for key in keys:
+            current = ws.groups.get(key)
+            if current and current.active():
+                skipped.append({"group": key, "reason": "already running"})
+                continue
+            recs = by_group.get(key, [])
+            w.apply_sampling(recs, s["sampling_enabled"], s["sample_pct"])
+            targets = w.ui_verification_targets(recs, profile)
+            if not targets:
+                skipped.append({"group": key, "reason": "nothing to verify"})
+                continue
+            job = Job("verify", len(targets), state="queued", group=key)
+            ws.groups[key] = job
+            queue_jobs.append((job, targets))
+        if not queue_jobs:
+            raise HTTPException(409, "Nothing to verify in " + ("this folder." if len(keys) == 1 else "these folders.") + " All eligible records are already verified or running.")
+        ws.db.save_records(batch_id, batch["records"])  # sampling decisions
+        ws.release = None
+    todo = queue.Queue()
+    for item in queue_jobs:
+        todo.put(item)
+
+    def worker():
+        while True:
+            try:
+                job, targets = todo.get_nowait()
+            except queue.Empty:
+                return
+            if job.begin():  # skipped if the group was stopped while it waited
+                run_verify(job, targets, batch_id, config, policy, s["workers"])
+
+    for _ in range(min(parallel, len(queue_jobs))):
+        threading.Thread(target=worker, daemon=True).start()
+    return {"started": [j.group for j, _ in queue_jobs], "skipped": skipped, "parallel": min(parallel, len(queue_jobs)), "job": current_job_view()}
+
+
 @app.post("/api/stop")
-def stop():
-    """Ask the running step (Agent 1 or Quality Gate) to stop. Work already finished is kept."""
-    current = ws.job
-    if not current or current.state != "running":
+def stop(body: dict = Body(default={})):
+    """Ask running steps to stop. Without a body everything stops; {"groups": [...]} stops only those folders.
+    Work already finished is kept; groups still waiting in the queue are cancelled."""
+    keys = body.get("groups")
+    targets = []
+    if ws.job and ws.job.state == "running" and keys is None:
+        targets.append(ws.job)
+    targets += [j for k, j in ws.groups.items() if j.active() and (keys is None or k in set(map(str, keys)))]
+    if not targets:
         raise HTTPException(409, "Nothing is running.")
-    current.stop.set()
-    return current.view()
+    for job in targets:
+        job.stop.set()
+        if job.state == "queued":
+            job.finish()
+    return current_job_view()
 
 
 def _blank_group(key, label):
@@ -669,7 +790,13 @@ def pipeline(by: str = "folder", folder: str | None = None, q: str = "", state: 
             for sect in ("agent1", "gate", "ptsl"):
                 for k, v in g[sect].items():
                     out[sect][k] += v
-        return _finish_group(out)
+        _finish_group(out)
+        job = ws.groups.get(key) if by == "folder" else None
+        if job:
+            out["job"] = {k: v for k, v in job.view().items() if k in {"state", "done", "total", "eta", "rate", "stopping"}}
+            if job.active():
+                out["state"] = "queued" if job.state == "queued" else "running"
+        return out
 
     files = list(per_file.values())
     if by == "file":
@@ -692,24 +819,30 @@ def pipeline(by: str = "folder", folder: str | None = None, q: str = "", state: 
     job_view = ws.job.view() if ws.job else None
     eta = job_view["eta"] if job_view and job_view["state"] == "running" else None
     limit = max(1, min(limit, 500))
-    return {"by": by, "total": total, "groups": rows[offset:offset + limit], "count": len(rows), "folders": len({g["folder"] for g in files}), "files": len(files),
+    active_jobs = {"running": sum(j.state == "running" for j in ws.groups.values()), "queued": sum(j.state == "queued" for j in ws.groups.values())}
+    return {"by": by, "active_groups": active_jobs, "total": total, "groups": rows[offset:offset + limit], "count": len(rows), "folders": len({g["folder"] for g in files}), "files": len(files),
             "job": job_view, "eta": eta, "states": dict(states)}
 
 
 @app.get("/api/job")
 def job():
-    return ws.job.view() if ws.job else None
+    return current_job_view()
 
 
 @app.get("/api/records")
-def records(gate: str = "", status: str = "", q: str = "", offset: int = 0, limit: int = 50):
+def records(gate: str = "", status: str = "", q: str = "", offset: int = 0, limit: int = 50, group: str | None = None):
     batch = need_batch()
-    if running():
+    if (running() if group is None else group_busy(group)):
         raise HTTPException(423, "Processing in progress.")
+    gmap = group_map(batch)
     q = q.strip().lower()
-    rows = [r for r in batch["records"] if (not gate or w.gate_outcome(r) == gate) and (not status or r["status"] == status) and (not q or q in (r.get("original_text") or w.record_text(r) or "").lower() or q in r["id"].lower())]
+    rows = [r for r in batch["records"] if (group is None or gmap.get(r.get("source_id"), "") == group) and (not gate or w.gate_outcome(r) == gate) and (not status or r["status"] == status) and (not q or q in (r.get("original_text") or w.record_text(r) or "").lower() or q in r["id"].lower())]
     limit = max(1, min(200, limit))
     return {"total": len(rows), "items": [row(r) for r in rows[max(0, offset):max(0, offset) + limit]]}
+
+
+def record_busy(rec):
+    return group_busy(group_map(ws.batch).get(rec.get("source_id"), "")) if ws.batch else running()
 
 
 def find(record_id):
@@ -721,9 +854,10 @@ def find(record_id):
 
 @app.get("/api/records/{record_id}")
 def record_detail(record_id: str):
-    if running():
+    rec = find(record_id)
+    if record_busy(rec):
         raise HTTPException(423, "Processing in progress.")
-    return row(find(record_id), detail=True)
+    return row(rec, detail=True)
 
 
 def swap_in(record):
@@ -738,8 +872,9 @@ VERDICT = {"APPROVE": "approve", "QUARANTINE": "reject", "UNSURE": "unsure"}
 
 @app.post("/api/records/{record_id}/review")
 def review(record_id: str, body: dict = Body(...)):
-    need_idle()
     need_batch()
+    if (ws.job and ws.job.state == "running") or record_busy(find(record_id)):
+        raise HTTPException(423, "A processing step is still running.")
     action = str(body.get("action", "")).upper()
     with ws.lock:
         role, profile = ws.settings["reviewer"], ws.profile()
@@ -834,7 +969,7 @@ if DIST.exists():
         target = (DIST / path).resolve()
         if path and DIST in target.parents and target.is_file():
             return FileResponse(target)
-        return FileResponse(DIST / "index.html")
+        return FileResponse(DIST / "index.html", headers={"Cache-Control": "no-cache, must-revalidate"})
 
 if __name__ == "__main__":
     import uvicorn

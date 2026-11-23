@@ -1,10 +1,11 @@
-import React from "react";
+import React, { useState } from "react";
 import { GateStep, ReleaseStep, ReviewStep, UploadStep } from "./steps.jsx";
 import { PipelineView } from "./pipeline.jsx";
 import { Icon } from "./ui.jsx";
 
 /** Stepper + the active step. Steps unlock as the pipeline advances. */
 export function Pipeline({ st, view, setView, refresh, notify }) {
+  const [group, setGroup] = useState(null);
   const has = st.has_batch;
   const released = st.release?.status === "ready";
   const steps = [
@@ -21,7 +22,7 @@ export function Pipeline({ st, view, setView, refresh, notify }) {
     <>
       <nav className="stepper five" aria-label="Pipeline steps">
         {steps.map((s) => (
-          <button key={s.n} className={`step ${view === s.n ? "active" : ""} ${s.done ? "done" : ""}`} disabled={!s.open} onClick={() => setView(s.n)} aria-current={view === s.n ? "step" : undefined}>
+          <button key={s.n} className={`step ${view === s.n ? "active" : ""} ${s.done ? "done" : ""}`} disabled={!s.open} onClick={() => { if (s.n === 3) setGroup(null); setView(s.n); }} aria-current={view === s.n ? "step" : undefined}>
             <span className="badge">{s.done ? <Icon name="check" size={16} stroke={3} /> : s.overview ? <Icon name="grid" size={16} /> : s.n}</span>
             <span>
               <b>{s.title}</b>
@@ -33,9 +34,9 @@ export function Pipeline({ st, view, setView, refresh, notify }) {
       </nav>
       {view === 1 && <UploadStep {...props} />}
       {view === 2 && has && <GateStep {...props} />}
-      {view === 3 && has && <ReviewStep {...props} />}
+      {view === 3 && has && <ReviewStep {...props} group={group} clearGroup={() => setGroup(null)} />}
       {view === 4 && has && <ReleaseStep {...props} />}
-      {view === 5 && has && <PipelineView st={st} />}
+      {view === 5 && has && <PipelineView st={st} refresh={refresh} notify={notify} onReview={(key) => { setGroup(key); setView(3); }} />}
     </>
   );
 }

@@ -53,11 +53,12 @@ function Flow({ t }) {
   );
 }
 
-const STATE_LABEL = { waiting: "Waiting", running: "Running", review: "Needs review", done: "Done", empty: "Empty" };
+const STATE_LABEL = { waiting: "Waiting", queued: "Queued", running: "Running", review: "Needs review", done: "Done", empty: "Empty" };
 const Chip = ({ state }) => <span className={`chip ${state}`}>{STATE_LABEL[state] || state}</span>;
 
-function Cells({ g }) {
+function Cells({ g, actions }) {
   const gt = g.gate;
+  const live = g.job && ["running", "queued"].includes(g.job.state) ? g.job : null;
   return (
     <>
       <td className="num" title={`${g.messy} messy · Agent 1 applied ${g.agent1.applied}`}>
@@ -65,7 +66,7 @@ function Cells({ g }) {
         <Seg parts={[{ v: g.records - g.agent1.waiting, cls: "ok" }]} total={Math.max(g.records, 1)} />
       </td>
       <td className="num">
-        <b>{n(gt.checked)}</b> / {n(g.records)}
+        <b>{n(gt.checked)}</b> / {n(g.records)}{live && live.state === "running" && <small className="live"> · {n(live.done)}/{n(live.total)} now · {fmtTime(live.eta)} left</small>}
         <Seg parts={[{ v: gt.PASS, cls: "pass" }, { v: gt.WARN, cls: "warn" }, { v: gt.REVIEW, cls: "review" }, { v: gt.BLOCK, cls: "block" }, { v: gt.held, cls: "held" }]} total={g.records}
           title={`PASS ${gt.PASS} · WARN ${gt.WARN} · REVIEW ${gt.REVIEW} · BLOCK ${gt.BLOCK} · held ${gt.held}`} />
       </td>
@@ -87,13 +88,14 @@ function Cells({ g }) {
         ) : "–"}
       </td>
       <td><Chip state={g.state} /></td>
+      {actions && <td className="acts" onClick={(e) => e.stopPropagation()}>{actions(g)}</td>}
     </>
   );
 }
 
 const FILTERS = [["", "All"], ["waiting", "Waiting"], ["running", "Running"], ["review", "Needs review"], ["done", "Done"]];
 
-export function PipelineView({ st }) {
+export function PipelineView({ st, refresh, notify, onReview }) {
   const [by, setBy] = useState("folder");
   const [folder, setFolder] = useState(null);
   const [q, setQ] = useState("");
@@ -102,6 +104,8 @@ export function PipelineView({ st }) {
   const [page, setPage] = useState(0);
   const [data, setData] = useState(null);
   const [err, setErr] = useState("");
+  const [parallel, setParallel] = useState(3);
+  const [busyKey, setBusyKey] = useState("");
   const limit = 50;
 
   const load = useCallback(async () => {
@@ -123,6 +127,30 @@ export function PipelineView({ st }) {
   }, [load, running]);
   useEffect(() => setPage(0), [by, folder, q, state, sort]);
 
+  const run = async (groups) => {
+    setBusyKey(groups ? groups[0] : "*");
+    try {
+      const r = await api.verifyGroups(groups, parallel);
+      notify?.(`Started ${r.started.length} folder${r.started.length === 1 ? "" : "s"}, ${r.parallel} at a time.`);
+      await load();
+      refresh?.();
+    } catch (e) {
+      notify?.(e.message);
+    } finally {
+      setBusyKey("");
+    }
+  };
+  const halt = async (groups) => {
+    try {
+      await api.stop(groups);
+      await load();
+      refresh?.();
+    } catch (e) {
+      notify?.(e.message);
+    }
+  };
+  const active = (data?.active_groups?.running || 0) + (data?.active_groups?.queued || 0);
+
   if (!data) return <div className="card"><p className="sub">{err || "Loading pipeline…"}</p></div>;
   const t = data.total;
   const asFiles = folder !== null || by === "file";
@@ -143,6 +171,24 @@ export function PipelineView({ st }) {
           </div>
         </div>
         <Flow t={t} />
+        <div className="runbar">
+          <b>Run folders in parallel</b>
+          <label>
+            at a time
+            <select className="input" value={parallel} onChange={(e) => setParallel(Number(e.target.value))} aria-label="Folders at a time">
+              {[1, 2, 3, 4, 6, 8, 12].map((v) => <option key={v} value={v}>{v}</option>)}
+            </select>
+          </label>
+          <button className="btn primary" disabled={busyKey === "*" || (st.job?.state === "running" && !active)} onClick={() => run(null)}>
+            <Icon name="play" size={16} /> Run all folders
+          </button>
+          {active > 0 && (
+            <button className="btn danger" onClick={() => halt(null)}>
+              <Icon name="stop" size={16} /> Stop all ({data.active_groups.running} running{data.active_groups.queued ? `, ${data.active_groups.queued} queued` : ""})
+            </button>
+          )}
+          <span className="mono">Each folder is its own group with its own progress, Stop and review queue.</span>
+        </div>
         <div className="legend">
           <span><i className="pass" /> PASS</span><span><i className="warn" /> WARN</span><span><i className="review" /> REVIEW</span><span><i className="block" /> BLOCK</span><span><i className="held" /> held</span><span><i className="wait" /> waiting</span>
         </div>
@@ -191,6 +237,7 @@ export function PipelineView({ st }) {
                 <th>Progress</th>
                 <th>Left</th>
                 <th>State</th>
+                {!asFiles && <th>Actions</th>}
               </tr>
             </thead>
             <tbody>
@@ -201,10 +248,22 @@ export function PipelineView({ st }) {
                     {asFiles && g.folder && folder === null && <small className="mono">{g.folder}</small>}
                   </td>
                   {!asFiles && <td className="num">{n(g.files)}</td>}
-                  <Cells g={g} />
+                  <Cells g={g} actions={!asFiles ? (row) => {
+                    const on = row.job && ["running", "queued"].includes(row.job.state);
+                    return (
+                      <div className="row" style={{ gap: 6, flexWrap: "nowrap" }}>
+                        {on ? (
+                          <button className="btn danger sm" onClick={() => halt([row.key])} disabled={row.job.stopping}><Icon name="stop" size={13} /> Stop</button>
+                        ) : (
+                          <button className="btn sm" disabled={!row.remaining.quality_gate || busyKey === row.key} onClick={() => run([row.key])}><Icon name="play" size={13} /> Run</button>
+                        )}
+                        {row.ptsl.waiting > 0 && !on && <button className="btn sm" onClick={() => onReview?.(row.key)}>Review {n(row.ptsl.waiting)}</button>}
+                      </div>
+                    );
+                  } : null} />
                 </tr>
               ))}
-              {!data.groups.length && <tr><td colSpan={9} className="empty-row">Nothing matches this filter.</td></tr>}
+              {!data.groups.length && <tr><td colSpan={10} className="empty-row">Nothing matches this filter.</td></tr>}
             </tbody>
           </table>
         </div>

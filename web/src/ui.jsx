@@ -1,4 +1,5 @@
-import React from "react";
+import React, { useState } from "react";
+import { api } from "./api.js";
 
 export const GATES = ["PASS", "WARN", "REVIEW", "BLOCK"];
 
@@ -7,6 +8,7 @@ const paths = {
   check: "M5 12.5l4.5 4.5L19 7.5",
   arrow: "M5 12h14m0 0l-5-5m5 5l-5 5",
   play: "M8 5.5v13l11-6.5z",
+  stop: "M7 7h10v10H7z",
   logo: "M9 10l3 12 4-9 4 9 3-12",
   download: "M12 4v12m0 0l-4-4m4 4l4-4M5 20h14",
   reset: "M4 12a8 8 0 108-8M4 4v5h5",
@@ -53,6 +55,18 @@ export function Processing({ job }) {
   const meta = LABELS[job.kind] || LABELS.verify;
   const pct = job.total ? Math.round((job.done / job.total) * 100) : 0;
   const running = job.state === "running";
+  const stopped = job.state === "stopped";
+  const [asking, setAsking] = useState(false);
+  const stop = async () => {
+    setAsking(true);
+    try {
+      await api.stop();
+    } catch {
+      // the step may have just finished; polling shows the final state
+    } finally {
+      setAsking(false);
+    }
+  };
   return (
     <div className="proc" role="status" aria-live="polite">
       <div className={`ring ${running ? "live" : ""}`} style={{ "--p": pct }}>
@@ -63,7 +77,15 @@ export function Processing({ job }) {
           </div>
         </div>
       </div>
-      <h3 style={{ margin: "0 0 4px" }}>{running ? meta.title : "Finished"}</h3>
+      <h3 style={{ margin: "0 0 4px" }}>{running ? (job.stopping ? "Stopping… finishing the records already in progress" : meta.title) : stopped ? "Stopped" : "Finished"}</h3>
+      {stopped && <p className="sub" style={{ margin: "0 0 12px" }}>Records already processed are kept. Run the step again to continue with the rest.</p>}
+      {running && (
+        <div style={{ margin: "8px 0 16px" }}>
+          <button className="btn danger" onClick={stop} disabled={asking || job.stopping}>
+            <Icon name="stop" size={16} /> {job.stopping ? "Stopping…" : "Stop"}
+          </button>
+        </div>
+      )}
       <div className="stats">
         <div className="stat">
           <b className="num">{job.rate}</b>

@@ -37,6 +37,7 @@ export const api = {
   },
   sample: () => call("/api/sample", { method: "POST" }),
   verify: () => call("/api/verify", { method: "POST" }),
+  stop: () => call("/api/stop", { method: "POST" }),
   records: (params) => call("/api/records?" + new URLSearchParams(params)),
   record: (id) => call(`/api/records/${id}`),
   review: (id, action) => call(`/api/records/${id}/review`, { method: "POST", body: { action } }),

@@ -905,18 +905,22 @@ def verify_record(record, config, policy):
     record["history"].append({"action": "VERIFY", "status": record["status"], "at": now()})
 
 
-def verify_records(records, config, policy, workers=1, on_progress=None):
+def verify_records(records, config, policy, workers=1, on_progress=None, stop=None):
     """Verify records concurrently while keeping results deterministic.
 
     Workers verify private copies. Results are merged back into the original
     record objects in input order, from the calling thread only, so list order,
     record identity and persistence snapshots never see half-written records.
     on_progress(done, total, record) is called from the calling thread.
+    If `stop` (a threading.Event) is set, records that have not started are left untouched
+    (still unverified, so a later run continues with them); running ones finish and are kept.
     """
     total = len(records)
     workers = max(1, min(int(workers or 1), total or 1))
     if workers == 1:
         for done, record in enumerate(records, 1):
+            if stop is not None and stop.is_set():
+                break
             verify_record(record, config, policy)
             if on_progress:
                 on_progress(done, total, record)
@@ -939,6 +943,24 @@ def verify_records(records, config, policy, workers=1, on_progress=None):
                 cursor += 1
             if on_progress:
                 on_progress(done, total, copies[i])
+            if stop is not None and stop.is_set():
+                for pending in futures:
+                    pending.cancel()
+                break
+    if stop is not None and stop.is_set():
+        # keep every verification that completed, including ones that were already running
+        for future, i in futures.items():
+            if i in finished or future.cancelled() or not future.done():
+                continue
+            try:
+                future.result()
+            except Exception:
+                copies[i].update(status="ERROR", reason="Unexpected invalid verification response; retry after checking the server.")
+            finished.add(i)
+        for i in finished:
+            if i >= cursor:
+                records[i].clear()
+                records[i].update(copies[i])
 
 
 # ---------------------------------------------------------------------------
@@ -1035,13 +1057,14 @@ def agent1_eligible(record):
     return record["status"] == "PENDING" and record.get("kind") == "prose" and record.get("silver", {}).get("messy") and "agent1" not in record.get("silver", {}) and len(record.get("original_text", "")) <= AGENT1_MAX_CHARS
 
 
-def run_agent1(batch, config, workers=1, on_progress=None):
+def run_agent1(batch, config, workers=1, on_progress=None, stop=None):
     """Stage 1 Agent 1: restructure only messy prose records, concurrently, merging results on the calling thread."""
     eligible = [r for r in batch["records"] if agent1_eligible(r)]
-    outcomes = silver.parallel_map(lambda r: agent1_process(r, config), eligible, workers, on_progress)
+    outcomes = silver.parallel_map(lambda r: agent1_process(r, config), eligible, workers, on_progress, stop=stop)
     for record, outcome in zip(eligible, outcomes):
-        agent1_apply(record, outcome, config)
-    counts = Counter(o["status"] for o in outcomes)
+        if outcome is not None:  # None = skipped because the run was stopped
+            agent1_apply(record, outcome, config)
+    counts = Counter(o["status"] for o in outcomes if o is not None)
     batch.setdefault("silver", {})["agent1"] = {"enabled": True, "agent": AGENT1_NAME, "model": config.model, "eligible": len(eligible), **{k: counts.get(k, 0) for k in ("applied", "rejected", "error")}}
     return batch["silver"]["agent1"]
 

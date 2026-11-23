@@ -254,20 +254,37 @@ def validate_agent1_output(original_text, paragraphs, qa_pairs=()):
 
 # ---------------------------------------------------------------- helpers
 
-def parallel_map(fn, items, workers=1, on_progress=None):
+def parallel_map(fn, items, workers=1, on_progress=None, stop=None):
     """Run fn over items concurrently; results are returned in input order.
 
-    on_progress(done, total) runs on the calling thread only.
+    on_progress(done, total) runs on the calling thread only. If `stop` (a threading.Event) is set,
+    items that have not started are skipped and their result stays None; running items finish.
     """
     items = list(items)
     results = [None] * len(items)
     workers = max(1, min(int(workers or 1), len(items) or 1))
     if workers == 1:
         for i, item in enumerate(items):
+            if stop is not None and stop.is_set():
+                break
             results[i] = fn(item)
             if on_progress:
                 on_progress(i + 1, len(items))
         return results
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(fn, item): i for i, item in enumerate(items)}
+        done = 0
+        for future in as_completed(futures):
+            if future.cancelled():
+                continue
+            results[futures[future]] = future.result()
+            done += 1
+            if on_progress:
+                on_progress(done, len(items))
+            if stop is not None and stop.is_set():
+                for pending in futures:
+                    pending.cancel()
+    return results
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {pool.submit(fn, item): i for i, item in enumerate(items)}
         for done, future in enumerate(as_completed(futures), 1):

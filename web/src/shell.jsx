@@ -16,7 +16,7 @@ export function Pipeline({ st, view, setView, refresh, notify }) {
       pct: st.verified && st.review === 0 ? 100 : 0 },
     { n: 4, title: "Gold Release", sub: released ? "Ready to download" : `${st.gold_ready || 0} ready`, done: released, open: has && st.gold_ready > 0, pct: released ? 100 : 0 },
   ];
-  steps.push({ n: 5, title: "Pipeline", sub: has ? `${st.records} records · all files` : "Per file & folder", done: false, open: has, pct: 0, overview: true });
+  steps.unshift({ n: 5, title: "Pipeline", sub: has ? `${st.records.toLocaleString()} records · ${st.folders || 1} folder${st.folders === 1 ? "" : "s"}` : "Start here", done: false, open: has, pct: 0, overview: true });
   const props = { st, refresh, notify, go: setView };
   return (
     <>
@@ -36,7 +36,7 @@ export function Pipeline({ st, view, setView, refresh, notify }) {
       {view === 2 && has && <GateStep {...props} />}
       {view === 3 && has && <ReviewStep {...props} group={group} clearGroup={() => setGroup(null)} />}
       {view === 4 && has && <ReleaseStep {...props} />}
-      {view === 5 && has && <PipelineView st={st} refresh={refresh} notify={notify} onReview={(key) => { setGroup(key); setView(3); }} />}
+      {view === 5 && has && <PipelineView st={st} refresh={refresh} notify={notify} onReview={(key) => { setGroup(key); setView(3); }} goRelease={() => setView(4)} />}
     </>
   );
 }

@@ -5,119 +5,137 @@ import { Icon, fmtTime } from "./ui.jsx";
 const n = (v) => (v || 0).toLocaleString();
 const pct = (a, b) => (b ? Math.min(100, Math.round((a / b) * 100)) : 0);
 
-/** Segmented bar: each segment is {v, cls}; grey remainder = work still waiting. */
-function Seg({ parts, total, title }) {
+/** One stacked bar for a folder: green = finished, orange = waiting for a person, red = blocked, grey = not checked yet. */
+function Bar({ g, tall }) {
+  const total = Math.max(g.records, 1);
+  const parts = [
+    { v: g.gold, cls: "pass", tip: "ready for Gold" },
+    { v: g.ptsl.waiting, cls: "review", tip: "waiting for a reviewer" },
+    { v: g.gate.BLOCK, cls: "block", tip: "blocked" },
+    { v: g.gate.held, cls: "held", tip: "held back" },
+  ];
   const sum = parts.reduce((s, p) => s + p.v, 0);
+  const running = g.job?.state === "running";
   return (
-    <div className="seg" title={title}>
-      {parts.filter((p) => p.v > 0).map((p, i) => <i key={i} className={p.cls} style={{ width: `${pct(p.v, total)}%` }} />)}
-      {total > sum && <i className="wait" style={{ width: `${pct(total - sum, total)}%` }} />}
+    <div className={`seg ${tall ? "tall" : ""} ${running ? "live" : ""}`} title={`${n(g.gold)} ready · ${n(g.ptsl.waiting)} to review · ${n(g.gate.BLOCK)} blocked · ${n(g.gate.waiting)} not checked yet`}>
+      {parts.filter((p) => p.v > 0).map((p) => <i key={p.cls} className={p.cls} style={{ width: `${pct(p.v, total)}%` }} />)}
+      {total > sum && <i className="wait" style={{ width: `${pct(g.records - sum, total)}%` }} />}
     </div>
   );
 }
 
-function Stage({ name, state, main, sub, bar }) {
-  return (
-    <div className={`stage ${state}`}>
-      <small>{name}</small>
-      <b className="num">{main}</b>
-      <span>{sub}</span>
-      {bar}
-    </div>
-  );
-}
-
-/** The DAG strip: Bronze -> Silver -> Quality Gate -> PTSL review -> Gold, using whole-batch totals. */
-function Flow({ t }) {
-  const g = t.gate;
-  const gateTotal = t.records;
-  const gateState = g.waiting ? (g.checked ? "running" : "waiting") : "done";
-  const ptslState = !t.ptsl.needed && g.waiting ? "waiting" : t.ptsl.waiting ? "review" : g.waiting ? "waiting" : "done";
-  const a1 = t.agent1;
-  const a1Done = a1.applied + a1.rejected + a1.error;
-  return (
-    <div className="flow">
-      <Stage name="Bronze · raw files" state="done" main={`${n(t.files)} files`} sub={`${n(t.records)} records ingested`} bar={<Seg parts={[{ v: 1, cls: "ok" }]} total={1} />} />
-      <i className="arrow" />
-      <Stage name="Silver · cleaned" state={a1.waiting ? "running" : "done"} main={`${n(t.messy)} messy`} sub={`Agent 1: ${n(a1Done)} done${a1.waiting ? ` · ${n(a1.waiting)} waiting` : ""}`}
-        bar={<Seg parts={[{ v: a1.applied, cls: "ok" }, { v: a1.rejected + a1.error, cls: "bad" }]} total={Math.max(t.messy, 1)} />} />
-      <i className="arrow" />
-      <Stage name="Quality Gate · Qwen" state={gateState} main={`${n(g.checked)} / ${n(gateTotal)}`} sub={`${n(g.waiting)} waiting${g.held ? ` · ${n(g.held)} held` : ""}`}
-        bar={<Seg parts={[{ v: g.PASS, cls: "pass" }, { v: g.WARN, cls: "warn" }, { v: g.REVIEW, cls: "review" }, { v: g.BLOCK, cls: "block" }, { v: g.held, cls: "held" }]} total={gateTotal} title={`PASS ${g.PASS} · WARN ${g.WARN} · REVIEW ${g.REVIEW} · BLOCK ${g.BLOCK}`} />} />
-      <i className="arrow" />
-      <Stage name="PTSL · human review" state={ptslState} main={`${n(t.ptsl.done)} / ${n(t.ptsl.needed)}`} sub={`${n(t.ptsl.waiting)} waiting for a reviewer`}
-        bar={<Seg parts={[{ v: t.ptsl.done, cls: "ok" }]} total={Math.max(t.ptsl.needed, 1)} />} />
-      <i className="arrow" />
-      <Stage name="Gold · ready" state={t.gold && !g.waiting && !t.ptsl.waiting ? "done" : t.gold ? "running" : "waiting"} main={n(t.gold)} sub="records ready to release" bar={<Seg parts={[{ v: t.gold, cls: "pass" }]} total={Math.max(t.records, 1)} />} />
-    </div>
-  );
-}
-
-const STATE_LABEL = { waiting: "Waiting", queued: "Queued", running: "Running", review: "Needs review", done: "Done", empty: "Empty" };
+const STATE_LABEL = { waiting: "Not started", queued: "Queued", running: "Running", review: "Needs review", done: "Done", empty: "Empty" };
 const Chip = ({ state }) => <span className={`chip ${state}`}>{STATE_LABEL[state] || state}</span>;
 
-function Cells({ g, actions }) {
-  const gt = g.gate;
-  const live = g.job && ["running", "queued"].includes(g.job.state) ? g.job : null;
+/** The big "what should I do now?" card. */
+function NextStep({ nxt, parallel, setParallel, onRunAll, onStopAll, onReview, onRelease, busy }) {
+  const stepper = (
+    <label className="par" title="How many folders are checked by Qwen at the same time">
+      <span>Run</span>
+      <button className="step-btn" onClick={() => setParallel(Math.max(1, parallel - 1))} aria-label="Fewer">−</button>
+      <b className="num">{parallel}</b>
+      <button className="step-btn" onClick={() => setParallel(Math.min(16, parallel + 1))} aria-label="More">+</button>
+      <span>folders at a time</span>
+    </label>
+  );
+  const cases = {
+    run: { tone: "run", icon: "play", title: `${n(nxt.records)} records in ${n(nxt.folders)} folder${nxt.folders === 1 ? "" : "s"} are waiting for the Quality Gate`, sub: "Qwen checks each folder on its own, so they can run side by side.",
+      main: <button className="btn primary big" disabled={busy} onClick={onRunAll}><Icon name="play" size={18} /> Run all folders</button>, extra: stepper },
+    running: { tone: "running", icon: "grid", title: `Running… ${n(nxt.folders)} folder${nxt.folders === 1 ? "" : "s"} in progress`, sub: `${n(nxt.records)} records left${nxt.eta ? ` · about ${fmtTime(nxt.eta)} to go` : ""}. You can leave this page; it keeps going.`,
+      main: <button className="btn danger big" onClick={onStopAll}><Icon name="stop" size={18} /> Stop all</button> },
+    review: { tone: "review", icon: "check", title: `${n(nxt.records)} records need a human decision in ${n(nxt.folders)} folder${nxt.folders === 1 ? "" : "s"}`, sub: `Start with ${nxt.folder_label}, it has the most waiting. Approve, reject or skip each record.`,
+      main: <button className="btn primary big" onClick={() => onReview(nxt.folder)}>Start reviewing <Icon name="arrow" size={18} /></button> },
+    release: { tone: "done", icon: "check", title: `All done. ${n(nxt.records)} records are ready for Gold`, sub: "Every folder has been checked and reviewed.",
+      main: <button className="btn primary big" onClick={onRelease}>Go to release <Icon name="arrow" size={18} /></button> },
+    idle: { tone: "idle", icon: "grid", title: "Nothing to do right now", sub: "Upload more data, or look at a folder below.", main: null },
+  };
+  const c = cases[nxt.action] || cases.idle;
   return (
-    <>
-      <td className="num" title={`${g.messy} messy · Agent 1 applied ${g.agent1.applied}`}>
-        <b>{n(g.records)}</b>
-        <Seg parts={[{ v: g.records - g.agent1.waiting, cls: "ok" }]} total={Math.max(g.records, 1)} />
-      </td>
-      <td className="num">
-        <b>{n(gt.checked)}</b> / {n(g.records)}{live && live.state === "running" && <small className="live"> · {n(live.done)}/{n(live.total)} now · {fmtTime(live.eta)} left</small>}
-        <Seg parts={[{ v: gt.PASS, cls: "pass" }, { v: gt.WARN, cls: "warn" }, { v: gt.REVIEW, cls: "review" }, { v: gt.BLOCK, cls: "block" }, { v: gt.held, cls: "held" }]} total={g.records}
-          title={`PASS ${gt.PASS} · WARN ${gt.WARN} · REVIEW ${gt.REVIEW} · BLOCK ${gt.BLOCK} · held ${gt.held}`} />
-      </td>
-      <td className="num">
-        <b>{n(g.ptsl.done)}</b> / {n(g.ptsl.needed)}
-        <Seg parts={[{ v: g.ptsl.done, cls: "ok" }]} total={Math.max(g.ptsl.needed, 1)} />
-      </td>
-      <td className="num"><b>{n(g.gold)}</b></td>
-      <td className="num">
-        <b>{g.percent}%</b>
-        <Seg parts={[{ v: g.records - g.remaining.total, cls: "ok" }]} total={Math.max(g.records, 1)} />
-      </td>
-      <td className="num remain">
-        {g.remaining.total ? (
-          <>
-            <b>{n(g.remaining.total)}</b>
-            <small>{g.remaining.quality_gate ? `${n(g.remaining.quality_gate)} gate` : ""}{g.remaining.quality_gate && g.remaining.ptsl ? " · " : ""}{g.remaining.ptsl ? `${n(g.remaining.ptsl)} PTSL` : ""}</small>
-          </>
-        ) : "–"}
-      </td>
-      <td><Chip state={g.state} /></td>
-      {actions && <td className="acts" onClick={(e) => e.stopPropagation()}>{actions(g)}</td>}
-    </>
+    <div className={`next ${c.tone}`}>
+      <div className="next-icon"><Icon name={c.icon} size={26} /></div>
+      <div className="next-text">
+        <small>NEXT STEP</small>
+        <h2>{c.title}</h2>
+        <p>{c.sub}</p>
+      </div>
+      <div className="next-actions">
+        {c.main}
+        {c.extra}
+      </div>
+    </div>
   );
 }
 
-const FILTERS = [["", "All"], ["waiting", "Waiting"], ["running", "Running"], ["review", "Needs review"], ["done", "Done"]];
+/** Four numbers that say where the whole batch stands. */
+function Summary({ t }) {
+  const items = [
+    { label: "Uploaded", value: n(t.records), sub: `${n(t.files)} files`, cls: "" },
+    { label: "Checked by Qwen", value: `${pct(t.gate.checked, t.records)}%`, sub: `${n(t.gate.waiting)} not checked yet`, cls: "" },
+    { label: "Waiting for a person", value: n(t.ptsl.waiting), sub: `${n(t.ptsl.done)} already decided`, cls: t.ptsl.waiting ? "review" : "" },
+    { label: "Ready for Gold", value: n(t.gold), sub: `${t.percent}% of everything finished`, cls: t.gold ? "pass" : "" },
+  ];
+  return (
+    <div className="sum">
+      {items.map((i) => (
+        <div key={i.label} className={`sum-item ${i.cls}`}>
+          <b className="num">{i.value}</b>
+          <span>{i.label}</span>
+          <small>{i.sub}</small>
+        </div>
+      ))}
+    </div>
+  );
+}
 
-export function PipelineView({ st, refresh, notify, onReview }) {
-  const [by, setBy] = useState("folder");
-  const [folder, setFolder] = useState(null);
+/** Files inside an opened folder. */
+function Files({ folder, tick }) {
+  const [rows, setRows] = useState(null);
+  useEffect(() => {
+    let live = true;
+    api.pipeline({ by: "file", folder, sort: "name", limit: 200 }).then((d) => live && setRows(d.groups)).catch(() => {});
+    return () => { live = false; };
+  }, [folder, tick]);
+  if (!rows) return <div className="files"><span className="mono">Loading files…</span></div>;
+  return (
+    <div className="files">
+      {rows.map((f) => (
+        <div className="file" key={f.key}>
+          <span className="fname">{f.label}</span>
+          <span className="mono num">{n(f.records)} records</span>
+          <Bar g={f} />
+          <span className="num fmeta">{f.percent}%</span>
+          <Chip state={f.state} />
+        </div>
+      ))}
+    </div>
+  );
+}
+
+const FILTERS = [["", "All"], ["review", "Needs review"], ["running", "Running"], ["waiting", "Not started"], ["done", "Done"]];
+
+export function PipelineView({ st, refresh, notify, onReview, goRelease }) {
   const [q, setQ] = useState("");
   const [state, setState] = useState("");
   const [sort, setSort] = useState("remaining");
   const [page, setPage] = useState(0);
   const [data, setData] = useState(null);
   const [err, setErr] = useState("");
-  const [parallel, setParallel] = useState(3);
+  const [parallel, setParallel] = useState(() => Number(localStorage.getItem("wgs_parallel")) || 3);
   const [busyKey, setBusyKey] = useState("");
+  const [open, setOpen] = useState({});
+  const [picked, setPicked] = useState({});
+  const [tick, setTick] = useState(0);
   const limit = 50;
 
   const load = useCallback(async () => {
     try {
-      const params = { by: folder !== null ? "file" : by, q, state, sort, offset: page * limit, limit };
-      if (folder !== null) params.folder = folder;
-      setData(await api.pipeline(params));
+      setData(await api.pipeline({ by: "folder", q, state, sort, offset: page * limit, limit }));
       setErr("");
+      setTick((t) => t + 1);
     } catch (e) {
       setErr(e.message);
     }
-  }, [by, folder, q, state, sort, page]);
+  }, [q, state, sort, page]);
 
   const running = st.job?.state === "running";
   useEffect(() => {
@@ -125,13 +143,15 @@ export function PipelineView({ st, refresh, notify, onReview }) {
     const t = setInterval(() => !document.hidden && load(), running ? 2000 : 5000);
     return () => clearInterval(t);
   }, [load, running]);
-  useEffect(() => setPage(0), [by, folder, q, state, sort]);
+  useEffect(() => setPage(0), [q, state, sort]);
+  useEffect(() => { try { localStorage.setItem("wgs_parallel", String(parallel)); } catch {} }, [parallel]);
 
   const run = async (groups) => {
     setBusyKey(groups ? groups[0] : "*");
     try {
       const r = await api.verifyGroups(groups, parallel);
       notify?.(`Started ${r.started.length} folder${r.started.length === 1 ? "" : "s"}, ${r.parallel} at a time.`);
+      setPicked({});
       await load();
       refresh?.();
     } catch (e) {
@@ -149,70 +169,41 @@ export function PipelineView({ st, refresh, notify, onReview }) {
       notify?.(e.message);
     }
   };
-  const active = (data?.active_groups?.running || 0) + (data?.active_groups?.queued || 0);
 
   if (!data) return <div className="card"><p className="sub">{err || "Loading pipeline…"}</p></div>;
   const t = data.total;
-  const asFiles = folder !== null || by === "file";
   const pages = Math.max(1, Math.ceil(data.count / limit));
+  const chosen = Object.keys(picked).filter((k) => picked[k]);
+  const allShown = data.groups.length > 0 && data.groups.every((g) => picked[g.key]);
+
+  const action = (g) => {
+    const on = g.job && ["running", "queued"].includes(g.job.state);
+    if (on) return <button className="btn danger sm" onClick={() => halt([g.key])} disabled={g.job.stopping}><Icon name="stop" size={13} /> {g.job.state === "queued" ? "Cancel" : g.job.stopping ? "Stopping…" : "Stop"}</button>;
+    if (g.remaining.quality_gate > 0) return <button className="btn primary sm" disabled={busyKey === g.key} onClick={() => run([g.key])}><Icon name="play" size={13} /> Run</button>;
+    if (g.ptsl.waiting > 0) return <button className="btn sm review" onClick={() => onReview?.(g.key)}>Review {n(g.ptsl.waiting)}</button>;
+    return <span className="ok"><Icon name="check" size={15} stroke={3} /> Done</span>;
+  };
+
   return (
     <div className="pipe">
       <div className="card">
-        <div className="row spread" style={{ marginBottom: 14 }}>
-          <div>
-            <h2 style={{ margin: 0 }}>Pipeline overview</h2>
-            <p className="sub" style={{ margin: 0 }}>{n(data.files)} files in {n(data.folders)} folder{data.folders === 1 ? "" : "s"} · {n(t.records)} records</p>
-          </div>
-          <div className="kpis">
-            <div><b className="num">{t.percent}%</b><span>complete</span></div>
-            <div><b className="num">{n(t.remaining.total)}</b><span>left to do</span></div>
-            <div><b className="num">{n(t.remaining.ptsl)}</b><span>waiting for PTSL</span></div>
-            <div><b className="num">{data.eta != null ? fmtTime(data.eta) : "–"}</b><span>{running ? "step time left" : "no step running"}</span></div>
-          </div>
-        </div>
-        <Flow t={t} />
-        <div className="runbar">
-          <b>Run folders in parallel</b>
-          <label>
-            at a time
-            <select className="input" value={parallel} onChange={(e) => setParallel(Number(e.target.value))} aria-label="Folders at a time">
-              {[1, 2, 3, 4, 6, 8, 12].map((v) => <option key={v} value={v}>{v}</option>)}
-            </select>
-          </label>
-          <button className="btn primary" disabled={busyKey === "*" || (st.job?.state === "running" && !active)} onClick={() => run(null)}>
-            <Icon name="play" size={16} /> Run all folders
-          </button>
-          {active > 0 && (
-            <button className="btn danger" onClick={() => halt(null)}>
-              <Icon name="stop" size={16} /> Stop all ({data.active_groups.running} running{data.active_groups.queued ? `, ${data.active_groups.queued} queued` : ""})
-            </button>
-          )}
-          <span className="mono">Each folder is its own group with its own progress, Stop and review queue.</span>
-        </div>
-        <div className="legend">
-          <span><i className="pass" /> PASS</span><span><i className="warn" /> WARN</span><span><i className="review" /> REVIEW</span><span><i className="block" /> BLOCK</span><span><i className="held" /> held</span><span><i className="wait" /> waiting</span>
-        </div>
+        <NextStep nxt={data.next} parallel={parallel} setParallel={setParallel} busy={busyKey === "*"} onRunAll={() => run(null)} onStopAll={() => halt(null)} onReview={onReview} onRelease={goRelease} />
+        <Summary t={t} />
       </div>
 
       <div className="card">
         <div className="row spread" style={{ marginBottom: 12 }}>
-          <div className="row">
-            {folder !== null ? (
-              <button className="btn" onClick={() => setFolder(null)}><Icon name="arrow" size={14} /> All folders</button>
-            ) : (
-              <div className="seg-toggle">
-                <button className={by === "folder" ? "on" : ""} onClick={() => setBy("folder")}>By folder</button>
-                <button className={by === "file" ? "on" : ""} onClick={() => setBy("file")}>By file</button>
-              </div>
-            )}
-            {folder !== null && <b>{folder || "(top level)"}</b>}
+          <div>
+            <h2 style={{ margin: 0 }}>Folders</h2>
+            <p className="sub" style={{ margin: 0 }}>{n(data.folders)} folder{data.folders === 1 ? "" : "s"} · {n(data.files)} files. Each folder is its own group and runs on its own.</p>
           </div>
           <div className="row">
-            <input className="input" placeholder="Search folder or file…" value={q} onChange={(e) => setQ(e.target.value)} />
+            {chosen.length > 0 && <button className="btn primary" onClick={() => run(chosen)}><Icon name="play" size={15} /> Run {chosen.length} selected</button>}
+            <input className="input" placeholder="Search folders…" value={q} onChange={(e) => setQ(e.target.value)} />
             <select className="input" value={sort} onChange={(e) => setSort(e.target.value)} aria-label="Sort">
               <option value="remaining">Most work left</option>
-              <option value="percent">Least complete</option>
-              <option value="records">Most records</option>
+              <option value="percent">Least finished</option>
+              <option value="records">Biggest</option>
               <option value="name">Name</option>
             </select>
           </div>
@@ -224,58 +215,65 @@ export function PipelineView({ st, refresh, notify, onReview }) {
             </button>
           ))}
         </div>
-        <div className="table-wrap">
-          <table className="ptable">
-            <thead>
-              <tr>
-                <th>{asFiles ? "File" : "Folder"}</th>
-                {!asFiles && <th>Files</th>}
-                <th>Silver · records</th>
-                <th>Quality Gate</th>
-                <th>PTSL review</th>
-                <th>Gold</th>
-                <th>Progress</th>
-                <th>Left</th>
-                <th>State</th>
-                {!asFiles && <th>Actions</th>}
-              </tr>
-            </thead>
-            <tbody>
-              {data.groups.map((g) => (
-                <tr key={g.key} className={!asFiles ? "click" : ""} onClick={() => !asFiles && setFolder(g.key)}>
-                  <td className="name">
-                    <b>{g.label}</b>
-                    {asFiles && g.folder && folder === null && <small className="mono">{g.folder}</small>}
-                  </td>
-                  {!asFiles && <td className="num">{n(g.files)}</td>}
-                  <Cells g={g} actions={!asFiles ? (row) => {
-                    const on = row.job && ["running", "queued"].includes(row.job.state);
-                    return (
-                      <div className="row" style={{ gap: 6, flexWrap: "nowrap" }}>
-                        {on ? (
-                          <button className="btn danger sm" onClick={() => halt([row.key])} disabled={row.job.stopping}><Icon name="stop" size={13} /> Stop</button>
-                        ) : (
-                          <button className="btn sm" disabled={!row.remaining.quality_gate || busyKey === row.key} onClick={() => run([row.key])}><Icon name="play" size={13} /> Run</button>
-                        )}
-                        {row.ptsl.waiting > 0 && !on && <button className="btn sm" onClick={() => onReview?.(row.key)}>Review {n(row.ptsl.waiting)}</button>}
-                      </div>
-                    );
-                  } : null} />
-                </tr>
-              ))}
-              {!data.groups.length && <tr><td colSpan={10} className="empty-row">Nothing matches this filter.</td></tr>}
-            </tbody>
-          </table>
+
+        <div className="flist">
+          <div className="frow head">
+            <input type="checkbox" checked={allShown} onChange={(e) => setPicked(Object.fromEntries(data.groups.map((g) => [g.key, e.target.checked])))} aria-label="Select all shown" />
+            <span>Folder</span>
+            <span>Progress</span>
+            <span>State</span>
+            <span>Action</span>
+          </div>
+          {data.groups.map((g) => {
+            const isOpen = !!open[g.key];
+            const live = g.job?.state === "running" ? g.job : null;
+            return (
+              <div key={g.key} className={`fgroup ${g.state}`}>
+                <div className="frow">
+                  <input type="checkbox" checked={!!picked[g.key]} onChange={(e) => setPicked({ ...picked, [g.key]: e.target.checked })} aria-label={`Select ${g.label}`} />
+                  <button className="fname-btn" onClick={() => setOpen({ ...open, [g.key]: !isOpen })} aria-expanded={isOpen}>
+                    <i className={`chev ${isOpen ? "open" : ""}`} />
+                    <span>
+                      <b>{g.label}</b>
+                      <small>{n(g.files)} file{g.files === 1 ? "" : "s"} · {n(g.records)} records</small>
+                    </span>
+                  </button>
+                  <div className="fprog">
+                    <Bar g={g} tall />
+                    <div className="fnums">
+                      <span><b className="num">{g.percent}%</b> finished</span>
+                      {live ? <span className="live">checking {n(live.done)}/{n(live.total)} · {fmtTime(live.eta)} left</span> : (
+                        <>
+                          {g.remaining.quality_gate > 0 && <span>{n(g.remaining.quality_gate)} to check</span>}
+                          {g.ptsl.waiting > 0 && <span className="rv">{n(g.ptsl.waiting)} to review</span>}
+                          {g.gate.BLOCK > 0 && <span className="bk">{n(g.gate.BLOCK)} blocked</span>}
+                          {g.gold > 0 && <span className="gd">{n(g.gold)} ready</span>}
+                        </>
+                      )}
+                    </div>
+                  </div>
+                  <Chip state={g.state} />
+                  <div className="fact">{action(g)}</div>
+                </div>
+                {isOpen && <Files folder={g.key} tick={tick} />}
+              </div>
+            );
+          })}
+          {!data.groups.length && <div className="empty-row">Nothing matches this filter.</div>}
         </div>
+
         {pages > 1 && (
           <div className="row spread" style={{ marginTop: 12 }}>
-            <span className="mono">{n(data.count)} rows · page {page + 1} of {pages}</span>
+            <span className="mono">{n(data.count)} folders · page {page + 1} of {pages}</span>
             <div className="row">
               <button className="btn" disabled={page === 0} onClick={() => setPage(page - 1)}>Previous</button>
               <button className="btn" disabled={page + 1 >= pages} onClick={() => setPage(page + 1)}>Next</button>
             </div>
           </div>
         )}
+        <div className="legend">
+          <span><i className="pass" /> ready for Gold</span><span><i className="review" /> waiting for a reviewer</span><span><i className="block" /> blocked</span><span><i className="held" /> held back</span><span><i className="wait" /> not checked yet</span>
+        </div>
       </div>
     </div>
   );

@@ -763,6 +763,23 @@ def _finish_group(g):
     return g
 
 
+def next_action(folder_rows, total, job_view):
+    """The single most useful thing to do next, in plain terms, for the big button on the Pipeline page."""
+    if job_view and job_view["state"] == "running":
+        groups = job_view.get("groups") or {}
+        return {"action": "running", "folders": groups.get("running", 0) + groups.get("queued", 0) or 1, "records": job_view["total"] - job_view["done"], "eta": job_view["eta"]}
+    waiting = [g for g in folder_rows if g["remaining"]["quality_gate"] > 0]
+    if waiting:
+        return {"action": "run", "folders": len(waiting), "records": sum(g["remaining"]["quality_gate"] for g in waiting)}
+    review = [g for g in folder_rows if g["ptsl"]["waiting"] > 0]
+    if review:
+        top = max(review, key=lambda g: g["ptsl"]["waiting"])
+        return {"action": "review", "folders": len(review), "records": sum(g["ptsl"]["waiting"] for g in review), "folder": top["key"], "folder_label": top["label"]}
+    if total["gold"] > 0:
+        return {"action": "release", "records": total["gold"]}
+    return {"action": "idle"}
+
+
 @app.get("/api/pipeline")
 def pipeline(by: str = "folder", folder: str | None = None, q: str = "", state: str = "", sort: str = "remaining", offset: int = 0, limit: int = 100):
     """Airflow-style overview: per folder (or per file) progress through Bronze, Silver, Quality Gate, PTSL review and Gold."""
@@ -781,7 +798,7 @@ def pipeline(by: str = "folder", folder: str | None = None, q: str = "", state: 
     for g in per_file.values():
         _finish_group(g)
 
-    def merge(parts, key, label):
+    def merge(parts, key, label, with_job=False):
         out = _blank_group(key, label)
         for g in parts:
             out["files"] += g["files"]
@@ -791,7 +808,7 @@ def pipeline(by: str = "folder", folder: str | None = None, q: str = "", state: 
                 for k, v in g[sect].items():
                     out[sect][k] += v
         _finish_group(out)
-        job = ws.groups.get(key) if by == "folder" else None
+        job = ws.groups.get(key) if with_job else None
         if job:
             out["job"] = {k: v for k, v in job.view().items() if k in {"state", "done", "total", "eta", "rate", "stopping"}}
             if job.active():
@@ -799,13 +816,11 @@ def pipeline(by: str = "folder", folder: str | None = None, q: str = "", state: 
         return out
 
     files = list(per_file.values())
-    if by == "file":
-        rows = [g for g in files if folder is None or g["folder"] == folder]
-    else:
-        buckets = {}
-        for g in files:
-            buckets.setdefault(g["folder"], []).append(g)
-        rows = [merge(parts, key, key or "(top level)") for key, parts in buckets.items()]
+    buckets = {}
+    for g in files:
+        buckets.setdefault(g["folder"], []).append(g)
+    folder_rows = [merge(parts, key, key or "(top level)", with_job=True) for key, parts in buckets.items()]
+    rows = [g for g in files if folder is None or g["folder"] == folder] if by == "file" else list(folder_rows)
     total = merge(files, "all", "All files")
     states = Counter(g["state"] for g in rows)
     needle = q.strip().lower()
@@ -816,11 +831,11 @@ def pipeline(by: str = "folder", folder: str | None = None, q: str = "", state: 
     sorters = {"remaining": lambda g: (-g["remaining"]["total"], g["label"]), "name": lambda g: g["label"].lower(), "percent": lambda g: (g["percent"], g["label"]),
                "records": lambda g: (-g["records"], g["label"])}
     rows.sort(key=sorters.get(sort, sorters["remaining"]))
-    job_view = ws.job.view() if ws.job else None
+    job_view = current_job_view()
     eta = job_view["eta"] if job_view and job_view["state"] == "running" else None
     limit = max(1, min(limit, 500))
     active_jobs = {"running": sum(j.state == "running" for j in ws.groups.values()), "queued": sum(j.state == "queued" for j in ws.groups.values())}
-    return {"by": by, "active_groups": active_jobs, "total": total, "groups": rows[offset:offset + limit], "count": len(rows), "folders": len({g["folder"] for g in files}), "files": len(files),
+    return {"by": by, "next": next_action(folder_rows, total, job_view), "active_groups": active_jobs, "total": total, "groups": rows[offset:offset + limit], "count": len(rows), "folders": len({g["folder"] for g in files}), "files": len(files),
             "job": job_view, "eta": eta, "states": dict(states)}
 
 

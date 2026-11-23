@@ -80,7 +80,7 @@ export default function App() {
     const p = prev.current;
     if (p?.job?.state === "running" && st.job?.state !== "running" && st.job?.kind === "verify") notify(st.job.error || (st.job.state === "stopped" ? "Quality Gate stopped. Finished records were kept." : "Quality Gate finished."));
     if (!p && st.has_batch) setView(st.step);
-    if (p && !p.has_batch && st.has_batch) setView(1);
+    if (p && !p.has_batch && st.has_batch) setView(st.folders > 1 ? 5 : 1);
     if (p?.has_batch && !st.has_batch) setView(1);
     prev.current = st;
   }, [st, notify]);
